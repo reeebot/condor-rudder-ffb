@@ -2,3 +2,4 @@ LIBRARY dinput8.dll
 EXPORTS
     DirectInput8Create=DirectInput8Create@20
     MockGet=MockGet@4
+    MockFx=MockFx@8

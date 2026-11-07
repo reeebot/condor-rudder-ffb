@@ -5,8 +5,11 @@
  * Windows one; we load the real DirectInput from the system folder and pass every call
  * straight through. Only the force-feedback calls are touched:
  *
- *   - effect strengths (spring stiffness, shake magnitude, ...) are multiplied by the
- *     percentages in ffb_shim.ini (live reload, no restart needed)
+ *   - effect strengths are multiplied by the percentages in ffb_shim.ini (live reload):
+ *       spring: stiffness; past the 100% DirectInput cap a second "assist" spring on the same
+ *               axes carries the rest, so the boost keeps working at high speed
+ *       shake:  Condor drives its stall/VNE shake with the effect gain, so that is what we
+ *               scale (spilling into the magnitude once the gain is maxed)
  *   - every effect Condor creates, changes, starts or stops is written to ffb_shim.log and
  *     sent as one text line over UDP to 127.0.0.1 (so the pedal bridge can follow Condor's
  *     own stall/VNE shake)
@@ -25,7 +28,7 @@
 #include <stdarg.h>
 #include <string.h>
 
-#define SHIM_VERSION "0.1"
+#define SHIM_VERSION "0.2"
 
 /* ------------------------------------------------------------------ vtable slots */
 enum { DI8_CreateDevice = 3 };
@@ -33,7 +36,7 @@ enum {
     DEV_SetProperty = 6, DEV_GetDeviceInfo = 15, DEV_CreateEffect = 18,
     DEV_SendForceFeedbackCommand = 22, DEV_EnumEffectsInFile = 27
 };
-enum { FX_GetParameters = 5, FX_SetParameters = 6, FX_Start = 7, FX_Stop = 8 };
+enum { FX_Release = 2, FX_GetParameters = 5, FX_SetParameters = 6, FX_Start = 7, FX_Stop = 8 };
 
 /* ------------------------------------------------------------------ globals */
 typedef HRESULT (WINAPI *PFN_DI8Create)(HINSTANCE, DWORD, REFIID, LPVOID *, LPUNKNOWN);
@@ -45,10 +48,10 @@ static char g_dir[MAX_PATH];
 static int g_wide;
 
 typedef struct {
-    int spring, damper, shake, constant, master;
+    int spring, damper, shake, constant, master, spring_assist;
     int log, log_setp, max_mb, udp_port;
 } Cfg;
-static Cfg g_cfg = {100, 100, 100, 100, 100, 1, 1, 50, 55291};
+static Cfg g_cfg = {100, 100, 100, 100, 100, 1, 1, 1, 50, 55291};
 static FILETIME g_ini_mtime;
 static DWORD g_ini_check;
 
@@ -133,6 +136,16 @@ typedef struct {
     DWORD gain;
     unsigned sig;           /* signature of last logged SETP, to skip duplicates */
     int getp_logged;
+    void *dev;              /* device the effect lives on */
+    DIEFFECT base;          /* Condor's creation parameters, pointers re-aimed at copies below */
+    DWORD axes[4];
+    LONG dirs[4];
+    int running;
+    DWORD dev_gain, dev_mag;  /* periodic: gain and magnitude the device currently has */
+    void *assist;             /* spring: our extra spring for boosts past the 100% cap */
+    BYTE assist_ts[TS_MAX];
+    DWORD assist_ts_len, assist_gain;
+    int assist_fail;
 } Fx;
 static Fx g_fx[128];
 static int g_nfx, g_next_id;
@@ -237,7 +250,7 @@ static void emit(int kind, const char *fmt, ...)
     n += m;
     if (n > (int)sizeof buf - 2) n = (int)sizeof buf - 2;
     udp_send(buf, n);
-    if (!g_cfg.log) return;
+    if (kind == 2 || !g_cfg.log) return;
     open_log();
     if (!g_log) return;
     if (kind == 1) {
@@ -272,14 +285,16 @@ static void read_cfg(int announce)
     c.shake = clampi(GetPrivateProfileIntA("Gain", "shake", 100, ini), 0, 1000);
     c.constant = clampi(GetPrivateProfileIntA("Gain", "constant", 100, ini), 0, 1000);
     c.master = clampi(GetPrivateProfileIntA("Gain", "master", 100, ini), 0, 1000);
+    c.spring_assist = GetPrivateProfileIntA("Gain", "spring_assist", 1, ini) != 0;
     c.log = GetPrivateProfileIntA("Log", "enabled", 1, ini) != 0;
     c.log_setp = GetPrivateProfileIntA("Log", "log_changes", 1, ini) != 0;
     c.max_mb = clampi(GetPrivateProfileIntA("Log", "max_mb", 50, ini), 1, 2000);
     c.udp_port = clampi(GetPrivateProfileIntA("Bridge", "udp_port", 55291, ini), 0, 65535);
     g_cfg = c;
     if (announce)
-        emit(0, "CONFIG spring=%d damper=%d shake=%d constant=%d master=%d log=%d log_changes=%d udp_port=%d",
-             c.spring, c.damper, c.shake, c.constant, c.master, c.log, c.log_setp, c.udp_port);
+        emit(0, "CONFIG spring=%d spring_assist=%d damper=%d shake=%d constant=%d master=%d log=%d "
+             "log_changes=%d udp_port=%d", c.spring, c.spring_assist, c.damper, c.shake, c.constant, c.master,
+             c.log, c.log_setp, c.udp_port);
 }
 
 static void maybe_reload(void)
@@ -376,19 +391,28 @@ static LONG scl(LONG v, int pct, LONG lim, int *clip)
     return (LONG)r;
 }
 
-typedef struct { DIEFFECT e; BYTE ts[TS_MAX]; DIENVELOPE env; } Scaled;
+typedef struct { DIEFFECT e; BYTE ts[TS_MAX]; DIENVELOPE env; DWORD flags; } Scaled;
 
-/* Copy *in to *out with strengths scaled. Returns 1 if anything changed. */
-static int make_scaled(int sub, LPCDIEFFECT in, DWORD flags, Scaled *out, int *clip)
+static int copy_effect(LPCDIEFFECT in, Scaled *out, DWORD flags)
 {
-    int pct = pct_for(sub), changed = 0;
-    DWORD sz, i;
-    *clip = 0;
-    if (!in || pct == 100 || sub < 0) return 0;
+    DWORD sz;
+    if (!in) return 0;
     sz = in->dwSize;
     if (sz < sizeof(DIEFFECT_DX5) || sz > sizeof(DIEFFECT)) return 0;
     memset(out, 0, sizeof *out);
     memcpy(&out->e, in, sz);
+    out->flags = flags;
+    return 1;
+}
+
+/* Spring / damper / constant / ramp: scale the type-specific strengths. Returns 1 if changed. */
+static int make_scaled(int sub, LPCDIEFFECT in, DWORD flags, Scaled *out, int *clip)
+{
+    int pct = pct_for(sub), changed = 0;
+    DWORD i;
+    *clip = 0;
+    if (!in || pct == 100 || sub < 0 || IS_PERIODIC(sub)) return 0;
+    if (!copy_effect(in, out, flags)) return 0;
     if ((flags & DIEP_TYPESPECIFICPARAMS) && in->lpvTypeSpecificParams &&
         in->cbTypeSpecificParams > 0 && in->cbTypeSpecificParams <= TS_MAX) {
         memcpy(out->ts, in->lpvTypeSpecificParams, in->cbTypeSpecificParams);
@@ -405,10 +429,6 @@ static int make_scaled(int sub, LPCDIEFFECT in, DWORD flags, Scaled *out, int *c
                         c[i].dwNegativeSaturation = (DWORD)scl((LONG)c[i].dwNegativeSaturation, pct, 10000, &dummy);
                 }
             }
-        } else if (IS_PERIODIC(sub) && in->cbTypeSpecificParams >= sizeof(DIPERIODIC)) {
-            DIPERIODIC *p = (DIPERIODIC *)out->ts;
-            p->dwMagnitude = (DWORD)scl((LONG)p->dwMagnitude, pct, 10000, clip);
-            p->lOffset = scl(p->lOffset, pct, 10000, clip);
         } else if (sub == 0 && in->cbTypeSpecificParams >= sizeof(DICONSTANTFORCE)) {
             DICONSTANTFORCE *k = (DICONSTANTFORCE *)out->ts;
             k->lMagnitude = scl(k->lMagnitude, pct, 10000, clip);
@@ -420,7 +440,8 @@ static int make_scaled(int sub, LPCDIEFFECT in, DWORD flags, Scaled *out, int *c
         out->e.lpvTypeSpecificParams = out->ts;
         changed = 1;
     }
-    if ((flags & DIEP_ENVELOPE) && in->lpEnvelope && in->lpEnvelope->dwSize >= sizeof(DIENVELOPE)) {
+    if ((flags & DIEP_ENVELOPE) && in->lpEnvelope && in->lpEnvelope->dwSize >= sizeof(DIENVELOPE) &&
+        !IS_CONDITION(sub)) {
         int c2 = 0;
         out->env = *in->lpEnvelope;
         out->env.dwAttackLevel = (DWORD)scl((LONG)out->env.dwAttackLevel, pct, 10000, &c2);
@@ -429,6 +450,81 @@ static int make_scaled(int sub, LPCDIEFFECT in, DWORD flags, Scaled *out, int *c
         changed = 1;
     }
     return changed;
+}
+
+/* Periodic (Condor's stall / VNE shake): Condor sets the intensity through the effect gain
+ * (0-10000) on a fixed-magnitude triangle, so scale the gain. Once the gain hits 10000 the
+ * rest spills into the magnitude. Adds DIEP_GAIN / DIEP_TYPESPECIFICPARAMS as needed so the
+ * device always holds gain' x magnitude' = Condor's gain x magnitude x shake%. */
+static int scale_periodic(Fx *f, LPCDIEFFECT in, DWORD flags, Scaled *out, DWORD *g_out, DWORD *m_out, int *clip)
+{
+    int pct = g_cfg.shake;
+    DWORD base_gain, base_mag, g2, m2;
+    double want, m;
+    const DIPERIODIC *src;
+    *clip = 0;
+    if (!f || !in) return 0;
+    src = ((flags & DIEP_TYPESPECIFICPARAMS) && in->lpvTypeSpecificParams &&
+           in->cbTypeSpecificParams >= sizeof(DIPERIODIC)) ? (const DIPERIODIC *)in->lpvTypeSpecificParams
+          : (f->ts_len >= sizeof(DIPERIODIC) ? (const DIPERIODIC *)f->ts : NULL);
+    if (!src) return 0;
+    base_gain = (flags & DIEP_GAIN) ? in->dwGain : f->gain;
+    base_mag = src->dwMagnitude;
+    want = base_gain * (double)pct / 100.0;
+    g2 = want >= 10000.0 ? 10000 : (DWORD)(want + 0.5);
+    m = base_mag * (g2 > 0 && want > 10000.0 ? want / g2 : 1.0);
+    m2 = m >= 10000.0 ? 10000 : (DWORD)(m + 0.5);
+    if (want > 10000.0 && m > 10000.0) *clip = 1;
+    if (!copy_effect(in, out, flags)) return 0;
+    if ((flags & DIEP_GAIN) || g2 != f->dev_gain) {
+        out->e.dwGain = g2;
+        out->flags |= DIEP_GAIN;
+    }
+    if ((flags & DIEP_TYPESPECIFICPARAMS) || m2 != f->dev_mag) {
+        DWORD cb = (flags & DIEP_TYPESPECIFICPARAMS) ? in->cbTypeSpecificParams : f->ts_len;
+        if (cb > TS_MAX) cb = TS_MAX;
+        memcpy(out->ts, src, cb);
+        ((DIPERIODIC *)out->ts)->dwMagnitude = m2;
+        out->e.cbTypeSpecificParams = cb;
+        out->e.lpvTypeSpecificParams = out->ts;
+        out->flags |= DIEP_TYPESPECIFICPARAMS;
+    }
+    *g_out = g2;
+    *m_out = m2;
+    return out->flags != flags || ((flags & DIEP_GAIN) && g2 != base_gain) ||
+           ((flags & DIEP_TYPESPECIFICPARAMS) && m2 != base_mag);
+}
+
+/* Spring assist: per axis, whatever the boosted stiffness has above 10000 goes to the
+ * assist spring. Returns the byte length of the assist params (0 = no assist needed). */
+static DWORD assist_params(Fx *f, BYTE *out)
+{
+    DWORD i, n;
+    int any = 0;
+    const DICONDITION *c = (const DICONDITION *)f->ts;
+    DICONDITION *a = (DICONDITION *)out;
+    if (f->sub != 7 || !g_cfg.spring_assist || f->ts_len < sizeof(DICONDITION)) return 0;
+    n = f->ts_len / sizeof(DICONDITION);
+    for (i = 0; i < n; i++) {
+        long long kp = (long long)c[i].lPositiveCoefficient * g_cfg.spring / 100;
+        long long kn = (long long)c[i].lNegativeCoefficient * g_cfg.spring / 100;
+        a[i] = c[i];
+        a[i].lPositiveCoefficient = (LONG)(kp > 10000 ? (kp - 10000 > 10000 ? 10000 : kp - 10000)
+                                           : (kp < -10000 ? (kp + 10000 < -10000 ? -10000 : kp + 10000) : 0));
+        a[i].lNegativeCoefficient = (LONG)(kn > 10000 ? (kn - 10000 > 10000 ? 10000 : kn - 10000)
+                                           : (kn < -10000 ? (kn + 10000 < -10000 ? -10000 : kn + 10000) : 0));
+        /* same force ceiling as the boosted main spring (0 stays 0: no force) */
+        a[i].dwPositiveSaturation = (DWORD)(c[i].dwPositiveSaturation * (long long)g_cfg.spring / 100 > 10000 ? 10000
+                                            : c[i].dwPositiveSaturation * (long long)g_cfg.spring / 100);
+        a[i].dwNegativeSaturation = (DWORD)(c[i].dwNegativeSaturation * (long long)g_cfg.spring / 100 > 10000 ? 10000
+                                            : c[i].dwNegativeSaturation * (long long)g_cfg.spring / 100);
+        if (a[i].dwPositiveSaturation == 0 && a[i].dwNegativeSaturation == 0) {
+            a[i].lPositiveCoefficient = a[i].lNegativeCoefficient = 0;
+        }
+        if (a[i].lPositiveCoefficient || a[i].lNegativeCoefficient) any = 1;
+    }
+    if (!any && !f->assist) return 0;
+    return n * sizeof(DICONDITION);
 }
 
 static void remember(Fx *f, LPCDIEFFECT in, DWORD flags)
@@ -465,13 +561,88 @@ typedef HRESULT (WINAPI *PFN_GetParameters)(void *, LPDIEFFECT, DWORD);
 typedef HRESULT (WINAPI *PFN_SetParameters)(void *, LPCDIEFFECT, DWORD);
 typedef HRESULT (WINAPI *PFN_Start)(void *, DWORD, DWORD);
 typedef HRESULT (WINAPI *PFN_Stop)(void *);
+typedef ULONG (WINAPI *PFN_Release)(void *);
+typedef HRESULT (WINAPI *PFN_CreateEffect)(void *, REFGUID, LPCDIEFFECT, LPDIRECTINPUTEFFECT *, LPUNKNOWN);
+
+static const GUID GUID_Spring_ = {0x13541C27, 0x8E33, 0x11D0, {0x9A, 0xD0, 0x00, 0xA0, 0xC9, 0xA0, 0x6E, 0x35}};
+
+/* Bring the assist spring in line with Condor's spring. Called WITHOUT g_cs held. */
+static void sync_assist(Fx *f)
+{
+    BYTE ts[TS_MAX];
+    DWORD len;
+    void *assist, *dev;
+    int running, create = 0, update = 0;
+    DWORD gain, uflags = 0;
+    DIEFFECT e;
+    HRESULT hr = DI_OK;
+    EnterCriticalSection(&g_cs);
+    len = assist_params(f, ts);
+    assist = f->assist;
+    dev = f->dev;
+    running = f->running;
+    gain = f->gain;
+    if (len) {
+        if (!assist && f->assist_fail < 3 && dev) create = 1;
+        else if (assist) {
+            if (len != f->assist_ts_len || memcmp(ts, f->assist_ts, len)) uflags |= DIEP_TYPESPECIFICPARAMS;
+            if (gain != f->assist_gain) uflags |= DIEP_GAIN;
+            update = uflags != 0;
+        }
+    }
+    e = f->base;
+    e.dwSize = sizeof(DIEFFECT);
+    e.rgdwAxes = f->axes;
+    e.rglDirection = f->dirs;
+    e.lpEnvelope = NULL;
+    e.dwGain = gain;
+    e.cbTypeSpecificParams = len;
+    e.lpvTypeSpecificParams = ts;
+    LeaveCriticalSection(&g_cs);
+    if (create) {
+        PFN_CreateEffect ce = (PFN_CreateEffect)orig_of(dev, DEV_CreateEffect);
+        LPDIRECTINPUTEFFECT a = NULL;
+        hr = ce ? ce(dev, &GUID_Spring_, &e, &a, NULL) : DIERR_GENERIC;
+        if (SUCCEEDED(hr) && a && running) {
+            PFN_Start st = (PFN_Start)orig_of(a, FX_Start);
+            if (st) st(a, 1, 0);
+        }
+        EnterCriticalSection(&g_cs);
+        if (SUCCEEDED(hr) && a) {
+            f->assist = a;
+            memcpy(f->assist_ts, ts, len);
+            f->assist_ts_len = len;
+            f->assist_gain = gain;
+            emit(0, "ASSIST created for fx=%d %s k+=%ld (running=%d)", f->id, f->name,
+                 (long)((DICONDITION *)ts)->lPositiveCoefficient, running);
+        } else {
+            f->assist_fail++;
+            emit(0, "ASSIST create FAILED for fx=%d hr=0x%08lx (try %d of 3)", f->id, (unsigned long)hr,
+                 f->assist_fail);
+        }
+        LeaveCriticalSection(&g_cs);
+    } else if (update) {
+        PFN_SetParameters sp = (PFN_SetParameters)orig_of(assist, FX_SetParameters);
+        hr = sp ? sp(assist, &e, uflags) : DIERR_GENERIC;
+        EnterCriticalSection(&g_cs);
+        if (SUCCEEDED(hr)) {
+            memcpy(f->assist_ts, ts, len);
+            f->assist_ts_len = len;
+            f->assist_gain = gain;
+        } else {
+            emit(0, "ASSIST update FAILED for fx=%d hr=0x%08lx", f->id, (unsigned long)hr);
+        }
+        LeaveCriticalSection(&g_cs);
+    }
+}
 
 static HRESULT WINAPI Hook_SetParameters(void *self, LPCDIEFFECT peff, DWORD flags)
 {
     PFN_SetParameters orig;
     Fx *f;
     Scaled s;
-    int clip = 0, use;
+    int clip = 0, use = 0, periodic = 0;
+    DWORD g2 = 0, m2 = 0;
     HRESULT hr;
     char line[1500];
     int n;
@@ -479,14 +650,23 @@ static HRESULT WINAPI Hook_SetParameters(void *self, LPCDIEFFECT peff, DWORD fla
     maybe_reload();
     orig = (PFN_SetParameters)orig_of(self, FX_SetParameters);
     f = fx_find(self);
-    use = f ? make_scaled(f->sub, peff, flags, &s, &clip) : 0;
+    if (f && peff) {
+        periodic = IS_PERIODIC(f->sub);
+        use = periodic ? scale_periodic(f, peff, flags, &s, &g2, &m2, &clip)
+                       : make_scaled(f->sub, peff, flags, &s, &clip);
+        if (!use) s.flags = flags;
+    }
     LeaveCriticalSection(&g_cs);
     if (!orig) return DIERR_GENERIC;
-    hr = orig(self, use ? &s.e : peff, flags);
+    hr = orig(self, use ? &s.e : peff, use ? s.flags : flags);
     EnterCriticalSection(&g_cs);
     if (f && peff) {
         unsigned sig = sig_of(peff, flags);
         remember(f, peff, flags);
+        if (periodic && use && SUCCEEDED(hr)) {
+            if (s.flags & DIEP_GAIN) f->dev_gain = g2;
+            if (s.flags & DIEP_TYPESPECIFICPARAMS) f->dev_mag = m2;
+        }
         if (sig != f->sig || FAILED(hr) || (flags & DIEP_START)) {
             f->sig = sig;
             n = snprintf(line, sizeof line, "SETP fx=%d %s %s flags=0x%lx", f->id, f->name,
@@ -495,12 +675,17 @@ static HRESULT WINAPI Hook_SetParameters(void *self, LPCDIEFFECT peff, DWORD fla
             if (flags & DIEP_TYPESPECIFICPARAMS)
                 n += fmt_ts(line + n, sizeof line - n, f->sub, (const BYTE *)peff->lpvTypeSpecificParams,
                             peff->cbTypeSpecificParams);
-            if (use) n += snprintf(line + n, sizeof line - n, " x%d%%%s", pct_for(f->sub), clip ? " CLIPPED" : "");
+            if (use && periodic)
+                n += snprintf(line + n, sizeof line - n, " -> gain=%lu mag=%lu (x%d%%)%s", (unsigned long)g2,
+                              (unsigned long)m2, g_cfg.shake, clip ? " CLIPPED" : "");
+            else if (use)
+                n += snprintf(line + n, sizeof line - n, " x%d%%%s", pct_for(f->sub), clip ? " CLIPPED" : "");
             if (FAILED(hr)) n += snprintf(line + n, sizeof line - n, " hr=0x%08lx", (unsigned long)hr);
             emit((flags & DIEP_START) || FAILED(hr) ? 0 : 1, "%s", line);
         }
     }
     LeaveCriticalSection(&g_cs);
+    if (f && f->sub == 7 && SUCCEEDED(hr)) sync_assist(f);
     return hr;
 }
 
@@ -522,6 +707,7 @@ static HRESULT WINAPI Hook_GetParameters(void *self, LPDIEFFECT peff, DWORD flag
         if ((flags & DIEP_TYPESPECIFICPARAMS) && peff->lpvTypeSpecificParams && f->ts_len &&
             peff->cbTypeSpecificParams == f->ts_len)
             memcpy(peff->lpvTypeSpecificParams, f->ts, f->ts_len);
+        if ((flags & DIEP_GAIN) && IS_PERIODIC(f->sub)) peff->dwGain = f->gain;
         if ((flags & DIEP_ENVELOPE) && peff->lpEnvelope && f->has_env) {
             peff->lpEnvelope->dwAttackLevel = f->env.dwAttackLevel;
             peff->lpEnvelope->dwFadeLevel = f->env.dwFadeLevel;
@@ -540,6 +726,7 @@ static HRESULT WINAPI Hook_Start(void *self, DWORD iter, DWORD flags)
     PFN_Start orig;
     HRESULT hr;
     Fx *f;
+    void *assist = NULL;
     EnterCriticalSection(&g_cs);
     orig = (PFN_Start)orig_of(self, FX_Start);
     LeaveCriticalSection(&g_cs);
@@ -547,9 +734,14 @@ static HRESULT WINAPI Hook_Start(void *self, DWORD iter, DWORD flags)
     hr = orig(self, iter, flags);
     EnterCriticalSection(&g_cs);
     f = fx_find(self);
+    if (f && SUCCEEDED(hr)) {
+        f->running = 1;
+        assist = f->assist;
+    }
     emit(0, "START fx=%d %s %s iter=%lu flags=0x%lx hr=0x%08lx", f ? f->id : -1, f ? f->name : "?",
          sub_name(f ? f->sub : -1), (unsigned long)iter, (unsigned long)flags, (unsigned long)hr);
     LeaveCriticalSection(&g_cs);
+    if (assist) orig(assist, iter, flags & ~DIES_NODOWNLOAD);
     return hr;
 }
 
@@ -558,6 +750,7 @@ static HRESULT WINAPI Hook_Stop(void *self)
     PFN_Stop orig;
     HRESULT hr;
     Fx *f;
+    void *assist = NULL;
     EnterCriticalSection(&g_cs);
     orig = (PFN_Stop)orig_of(self, FX_Stop);
     LeaveCriticalSection(&g_cs);
@@ -565,14 +758,93 @@ static HRESULT WINAPI Hook_Stop(void *self)
     hr = orig(self);
     EnterCriticalSection(&g_cs);
     f = fx_find(self);
+    if (f) {
+        f->running = 0;
+        assist = f->assist;
+    }
     emit(0, "STOP fx=%d %s %s hr=0x%08lx", f ? f->id : -1, f ? f->name : "?", sub_name(f ? f->sub : -1),
          (unsigned long)hr);
     LeaveCriticalSection(&g_cs);
+    if (assist) orig(assist);
     return hr;
 }
 
+static ULONG WINAPI Hook_Release(void *self)
+{
+    PFN_Release orig;
+    ULONG left;
+    void *assist = NULL;
+    Fx *f;
+    EnterCriticalSection(&g_cs);
+    orig = (PFN_Release)orig_of(self, FX_Release);
+    LeaveCriticalSection(&g_cs);
+    if (!orig) return 0;
+    left = orig(self);
+    if (left == 0) {
+        EnterCriticalSection(&g_cs);
+        f = fx_find(self);
+        if (f) {
+            assist = f->assist;
+            f->assist = NULL;
+            emit(0, "RELEASE fx=%d %s", f->id, f->name);
+            f->fx = NULL;
+        }
+        LeaveCriticalSection(&g_cs);
+        if (assist) orig(assist);
+    }
+    return left;
+}
+
+/* Our assist springs die with a device reset; forget them so they get recreated. */
+static void drop_assists(void *dev)
+{
+    void *dead[16];
+    int i, nd = 0;
+    PFN_Release rel = NULL;
+    EnterCriticalSection(&g_cs);
+    for (i = 0; i < g_nfx && nd < 16; i++)
+        if (g_fx[i].fx && g_fx[i].assist && g_fx[i].dev == dev) {
+            dead[nd++] = g_fx[i].assist;
+            g_fx[i].assist = NULL;
+            g_fx[i].assist_ts_len = 0;
+        }
+    if (nd) rel = (PFN_Release)orig_of(dead[0], FX_Release);
+    LeaveCriticalSection(&g_cs);
+    for (i = 0; i < nd; i++) if (rel) rel(dead[i]);
+}
+
+/* Heartbeat for the pedal bridge: Condor's current shake gains and spring stiffness. */
+static Fx *latest_named(const char *name)
+{
+    int i;
+    Fx *best = NULL;
+    for (i = 0; i < g_nfx; i++)
+        if (g_fx[i].fx && !strcmp(g_fx[i].name, name) && (!best || g_fx[i].id > best->id)) best = &g_fx[i];
+    return best;
+}
+
+static DWORD WINAPI heartbeat(LPVOID arg)
+{
+    unsigned seq = 0;
+    (void)arg;
+    for (;;) {
+        Fx *s1, *s2, *sp;
+        Sleep(50);
+        EnterCriticalSection(&g_cs);
+        if (g_cfg.udp_port > 0) {
+            s1 = latest_named("Stall1");
+            s2 = latest_named("Stall2");
+            sp = latest_named("Spring");
+            emit(2, "STATE seq=%u stall1=%ld stall2=%ld spring_k=%ld", seq++,
+                 s1 ? (long)s1->gain : -1L, s2 ? (long)s2->gain : -1L,
+                 sp && sp->ts_len >= sizeof(DICONDITION) ? (long)((DICONDITION *)sp->ts)->lPositiveCoefficient : -1L);
+        }
+        LeaveCriticalSection(&g_cs);
+    }
+    return 0;
+}
+
 /* ------------------------------------------------------------------ device hooks */
-typedef HRESULT (WINAPI *PFN_CreateEffect)(void *, REFGUID, LPCDIEFFECT, LPDIRECTINPUTEFFECT *, LPUNKNOWN);
 typedef HRESULT (WINAPI *PFN_SetProperty)(void *, REFGUID, LPCDIPROPHEADER);
 typedef HRESULT (WINAPI *PFN_SendFFCmd)(void *, DWORD);
 typedef HRESULT (WINAPI *PFN_EnumFile)(void *, const void *, LPDIENUMEFFECTSINFILECALLBACK, LPVOID, DWORD);
@@ -608,7 +880,7 @@ static HRESULT WINAPI Hook_CreateEffect(void *self, REFGUID rguid, LPCDIEFFECT l
     maybe_reload();
     orig = (PFN_CreateEffect)orig_of(self, DEV_CreateEffect);
     sub = fx_sub(rguid);
-    use = make_scaled(sub, lpeff, all, &s, &clip);
+    use = make_scaled(sub, lpeff, all, &s, &clip);   /* periodic: scaled later, through the gain */
     LeaveCriticalSection(&g_cs);
     if (!orig) return DIERR_GENERIC;
     hr = orig(self, rguid, use ? &s.e : lpeff, ppdeff, outer);
@@ -619,8 +891,21 @@ static HRESULT WINAPI Hook_CreateEffect(void *self, REFGUID rguid, LPCDIEFFECT l
         char line[1500];
         int n;
         f->sub = sub;
+        f->dev = self;
         name_for_new_effect(sub, lpeff, f->name, sizeof f->name);
         remember(f, lpeff, all | DIEP_GAIN);
+        if (lpeff && lpeff->dwSize >= sizeof(DIEFFECT_DX5) && lpeff->dwSize <= sizeof(DIEFFECT)) {
+            DWORD i;
+            memcpy(&f->base, lpeff, lpeff->dwSize);
+            f->base.cAxes = lpeff->cAxes > 4 ? 4 : lpeff->cAxes;
+            for (i = 0; i < f->base.cAxes; i++) {
+                f->axes[i] = lpeff->rgdwAxes ? lpeff->rgdwAxes[i] : 0;
+                f->dirs[i] = lpeff->rglDirection ? lpeff->rglDirection[i] : 0;
+            }
+        }
+        f->dev_gain = lpeff ? lpeff->dwGain : 10000;
+        f->dev_mag = (IS_PERIODIC(sub) && f->ts_len >= sizeof(DIPERIODIC)) ? ((DIPERIODIC *)f->ts)->dwMagnitude : 0;
+        patch_slot(*(void ***)fx, FX_Release, (void *)Hook_Release);
         patch_slot(*(void ***)fx, FX_GetParameters, (void *)Hook_GetParameters);
         patch_slot(*(void ***)fx, FX_SetParameters, (void *)Hook_SetParameters);
         patch_slot(*(void ***)fx, FX_Start, (void *)Hook_Start);
@@ -674,6 +959,7 @@ static HRESULT WINAPI Hook_SendFFCmd(void *self, DWORD cmd)
     emit(0, "FFCMD dev=%p cmd=0x%lx", self, (unsigned long)cmd);
     LeaveCriticalSection(&g_cs);
     if (!orig) return DIERR_GENERIC;
+    if (cmd & DISFFC_RESET) drop_assists(self);
     return orig(self, cmd);
 }
 
@@ -759,8 +1045,10 @@ static void log_device(void *dev)
             ffdrv = a.guidFFDriver;
         }
     }
+    EnterCriticalSection(&g_cs);
     emit(0, "DEVICE dev=%p \"%s\" type=0x%lx ff=%s", dev, name, (unsigned long)type,
          memcmp(&ffdrv, &zero, sizeof ffdrv) ? "yes" : "no");
+    LeaveCriticalSection(&g_cs);
 }
 
 static HRESULT WINAPI Hook_CreateDevice(void *self, REFGUID rguid, LPDIRECTINPUTDEVICE8A *pp, LPUNKNOWN outer)
@@ -779,8 +1067,8 @@ static HRESULT WINAPI Hook_CreateDevice(void *self, REFGUID rguid, LPDIRECTINPUT
         patch_slot(vt, DEV_CreateEffect, (void *)Hook_CreateEffect);
         patch_slot(vt, DEV_SendForceFeedbackCommand, (void *)Hook_SendFFCmd);
         patch_slot(vt, DEV_EnumEffectsInFile, (void *)Hook_EnumFile);
-        log_device(*pp);
         LeaveCriticalSection(&g_cs);
+        log_device(*pp);
     }
     return hr;
 }
@@ -803,6 +1091,7 @@ HRESULT WINAPI DirectInput8Create(HINSTANCE h, DWORD ver, REFIID riid, LPVOID *p
         maybe_reload();
         if (!g_ini_mtime.dwLowDateTime && !g_ini_mtime.dwHighDateTime)
             emit(0, "CONFIG ffb_shim.ini not found next to the dll - everything at 100%%");
+        CloseHandle(CreateThread(NULL, 0, heartbeat, NULL, 0, NULL));
     }
     if (!load_real()) {
         emit(0, "ERROR could not load the system dinput8.dll");

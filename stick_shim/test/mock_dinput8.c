@@ -19,13 +19,15 @@ static void WINAPI bad(void) { ExitProcess(99); }
 static HRESULT WINAPI qi(void *s, REFIID r, void **pp) { *pp = NULL; return E_NOINTERFACE; }
 static ULONG WINAPI addref(void *s) { return 2; }
 static ULONG WINAPI release(void *s) { return 1; }
+static ULONG WINAPI e_release(void *s) { ((struct { void **vt; int sub; BYTE ts[256]; DWORD ts_len; DWORD gain; int started, released; } *)s)->released++; return 0; }
 
-typedef struct { void **vt; int sub; BYTE ts[256]; DWORD ts_len; } Eff;
+typedef struct { void **vt; int sub; BYTE ts[256]; DWORD ts_len; DWORD gain; int started, released; } Eff;
 static Eff g_eff[16];
 static int g_neff;
 
 static void take(Eff *e, LPCDIEFFECT p, DWORD flags)
 {
+    if (flags & DIEP_GAIN) e->gain = p->dwGain;
     if ((flags & DIEP_TYPESPECIFICPARAMS) && p->lpvTypeSpecificParams && p->cbTypeSpecificParams <= 256) {
         memcpy(e->ts, p->lpvTypeSpecificParams, p->cbTypeSpecificParams);
         e->ts_len = p->cbTypeSpecificParams;
@@ -44,9 +46,9 @@ static HRESULT WINAPI e_getp(void *s, LPDIEFFECT p, DWORD flags)
     return DI_OK;
 }
 static HRESULT WINAPI e_setp(void *s, LPCDIEFFECT p, DWORD flags) { take(s, p, flags); return DI_OK; }
-static HRESULT WINAPI e_start(void *s, DWORD it, DWORD fl) { g_val[4]++; return DI_OK; }
+static HRESULT WINAPI e_start(void *s, DWORD it, DWORD fl) { g_val[4]++; ((Eff *)s)->started++; return DI_OK; }
 static HRESULT WINAPI e_stop(void *s) { g_val[5]++; return DI_OK; }
-static void *EFF_VT[13] = {qi, addref, release, bad, bad, e_getp, e_setp, e_start, e_stop, bad, bad, bad, bad};
+static void *EFF_VT[13] = {qi, addref, e_release, bad, bad, e_getp, e_setp, e_start, e_stop, bad, bad, bad, bad};
 
 static HRESULT WINAPI d_setprop(void *s, REFGUID g, LPCDIPROPHEADER ph)
 {
@@ -74,7 +76,7 @@ static HRESULT WINAPI d_create(void *s, REFGUID g, LPCDIEFFECT p, LPDIRECTINPUTE
     Eff *e = &g_eff[g_neff++];
     e->vt = EFF_VT;
     e->sub = sub_of(g);
-    take(e, p, DIEP_TYPESPECIFICPARAMS);
+    take(e, p, DIEP_TYPESPECIFICPARAMS | DIEP_GAIN);
     g_val[7]++;
     *pp = (LPDIRECTINPUTEFFECT)e;
     return DI_OK;
@@ -82,8 +84,8 @@ static HRESULT WINAPI d_create(void *s, REFGUID g, LPCDIEFFECT p, LPDIRECTINPUTE
 static HRESULT WINAPI d_ffcmd(void *s, DWORD c) { g_val[8] = (LONG)c; return DI_OK; }
 static HRESULT WINAPI d_enumfile(void *s, LPCSTR f, LPDIENUMEFFECTSINFILECALLBACK cb, LPVOID ref, DWORD fl)
 {
-    static DICONDITION spring[2] = {{0, 3000, 3000, 10000, 10000, 0}, {0, 3000, 3000, 10000, 10000, 0}};
-    static DIPERIODIC tri = {6000, 0, 0, 159000};
+    static DICONDITION spring[2] = {{0, 10000, 10000, 0, 0, 0}, {0, 10000, 10000, 0, 0, 0}};
+    static DIPERIODIC tri = {10000, 0, 0, 158900}, tri2 = {7100, 0, 0, 205300};
     static DWORD axes[2] = {0, 4};
     static LONG dir[2] = {0, 0};
     static DIEFFECT es, et;
@@ -96,6 +98,9 @@ static HRESULT WINAPI d_enumfile(void *s, LPCSTR f, LPDIENUMEFFECTSINFILECALLBAC
     fe.GuidEffect = GUID_Spring; fe.lpDiEffect = &es; lstrcpyA(fe.szFriendlyName, "Spring");
     if (cb(&fe, ref) != DIENUM_CONTINUE) return DI_OK;
     fe.GuidEffect = GUID_Triangle; fe.lpDiEffect = &et; lstrcpyA(fe.szFriendlyName, "Stall1");
+    if (cb(&fe, ref) != DIENUM_CONTINUE) return DI_OK;
+    et.lpvTypeSpecificParams = &tri2;
+    fe.lpDiEffect = &et; lstrcpyA(fe.szFriendlyName, "Stall2");
     cb(&fe, ref);
     return DI_OK;
 }
@@ -115,3 +120,20 @@ HRESULT WINAPI DirectInput8Create(HINSTANCE h, DWORD v, REFIID r, LPVOID *pp, LP
     return DI_OK;
 }
 LONG WINAPI MockGet(int i) { return (i >= 0 && i < 16) ? g_val[i] : -1; }
+/* what: 0 sub, 1 gain, 2 magnitude (periodic) or k+ axis 0 (condition), 3 started, 4 released, 5 sat+ */
+LONG WINAPI MockFx(int idx, int what)
+{
+    Eff *e;
+    if (idx < 0) return g_neff;
+    if (idx >= g_neff) return -999;
+    e = &g_eff[idx];
+    switch (what) {
+    case 0: return e->sub;
+    case 1: return (LONG)e->gain;
+    case 2: return (e->sub >= 2 && e->sub <= 6) ? (LONG)((DIPERIODIC *)e->ts)->dwMagnitude : ((DICONDITION *)e->ts)->lPositiveCoefficient;
+    case 3: return e->started;
+    case 4: return e->released;
+    case 5: return (LONG)((DICONDITION *)e->ts)->dwPositiveSaturation;
+    }
+    return -998;
+}

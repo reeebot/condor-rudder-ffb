@@ -18,10 +18,10 @@ Python 3.8+, standard library only. Windows.
 |---|---|
 | **Airflow load** | No spring. Stopped or slow, the pedals are limp and stay where you put them. From ~3 kt the airflow centres them, building with airspeed; above 70 kt (about ¾ of max) it keeps rising more gently up to ~133 kt. |
 | **Yaw feel** | The pedal you push pushes back harder the further you yaw (driven by Condor's yaw string). |
-| **Stall flutter** | Condor sends no angle of attack, so it uses the physics equivalent: IAS below stall onset × √g. Builds gradually, plus a faster buzz deep in the stall. Works in turns too. |
+| **Stall flutter** | With the stick shim installed, the pedals flutter with **Condor's own stall shake**: same moment and strength as the stick, right for every glider and ballast. Without it: IAS below stall onset × √g. Plus a faster buzz deep in the stall. |
 | **Airbrake buffet** | Condor doesn't send airbrake position, so the bridge reads your airbrake lever directly. Already strong by ~60 kt (about 80%), full at 110 kt. |
 | **Structural failure** | When a wing comes off (a violent, sustained roll at speed), every buzz and flutter stops instantly, like Condor's stick does, until the next flight. |
-| **High-speed buffet** | A fine buzz that creeps in above 115 kt and builds hard toward VNE (145 kt by default; set it per glider). |
+| **High-speed buffet** | A fine buzz that creeps in above 115 kt and builds hard toward VNE (145 kt by default; set it per glider). With the shim, Condor's own VNE flutter comes through too. |
 | **Ground rumble** | Scales with ground speed and Condor's surface roughness. |
 
 Everything is tunable in `settings.ini`, and **changes apply live** while you fly.
@@ -31,16 +31,34 @@ Everything is tunable in `settings.ini`, and **changes apply live** while you fl
 Condor's own stick force feedback is good but soft, and Condor has no strength setting. The
 `stick_shim` is a small stand-in `dinput8.dll` that sits next to `Condor.exe`. Condor loads it
 instead of Windows' DirectInput; it loads the real one and passes everything straight through,
-except the force-feedback commands, which it multiplies by the percentages in `ffb_shim.ini`
-(spring, shake, damper, constant). Edits apply within half a second, mid-flight.
+except the force-feedback commands, which it scales by the percentages in `ffb_shim.ini`.
+Edits apply within half a second, mid-flight.
+
+What Condor actually sends (measured with the shim's log):
+
+- **Spring**: one spring on both stick axes, stiffness proportional to airspeed (about 104 per kt
+  on DirectInput's 0-10000 scale), so it reaches DirectInput's 100% cap around 97 kt. It softens
+  sharply in the stall. Offset 0 (no trim through the spring in that flight).
+- **Shake**: two fixed triangle waves, *Stall1* (pitch, 159 ms) and *Stall2* (roll, 205 ms, 71%).
+  Condor drives them with the effect **gain**, updated at 20 Hz: both ramp up together in a stall
+  (peaking around 26% in a Std Cirrus, starting at an equivalent 1-g IAS of 35 kt), and *Stall2*
+  alone ramps to 100% over a second for VNE flutter, cutting to zero when the wing breaks.
+
+So the shim scales:
+
+- `spring`: the stiffness. Past the 100% cap an **assist spring** on the same axes carries the
+  rest, so the boost still works at high speed (`spring_assist=0` turns that off).
+- `shake`: the shake effects' gain, spilling into the magnitude once the gain is at 100%.
 
 - **No input lag**: stick axes and buttons never go through it, only force commands do.
 - **Log**: `ffb_shim.log` in the Condor folder lists every effect Condor creates, changes, starts
   and stops (Condor's names from `Effects.ffe`, real Unix-ms timestamps that line up with the
   `wall_ms` column of `record_flight.bat` recordings). `CLIPPED` means the boost hit the stick's
   maximum.
-- **Bridge feed**: each log line also goes out over UDP to `127.0.0.1:55291`, so the pedal bridge can
-  follow Condor's own stall and VNE shake.
+- **Bridge feed**: every 50 ms the shim sends Condor's current shake gains over UDP to
+  `127.0.0.1:55291` (`STATE ... stall1= stall2= spring_k=`), plus every log line. The pedal bridge
+  uses it for stall flutter and VNE flutter (`stall_source = auto`), and `record_flight.bat`
+  records it (`shim_*` columns).
 - **Install**: `install_stick_shim.bat` (Condor in `C:\Condor3`; pass another folder as the first
   argument). **Uninstall**: `uninstall_stick_shim.bat` - deletes the one DLL.
 - Unknown whether Condor's online file validation minds an extra DLL in its folder: try it offline
@@ -121,6 +139,7 @@ Protocol reference: <https://cls2sim.brunner-innovation.swiss/protocolv2.htm>
 
 ```
 python tests/smoke_test.py
+python tests/shim_feed_test.py
 ```
 
 Runs the bridge end to end against a fake Condor (`tests/mock_condor.py`, scripted takeoff, slip
@@ -128,8 +147,6 @@ and pause) and a fake CLS2Sim (`tests/mock_cls2sim.py`, validates every packet).
 
 ## Roadmap
 
-- **Pedals follow Condor's own stall shake** from the shim's UDP feed, instead of estimating the stall
-  from airspeed, so every glider and ballast state is right automatically.
 - **Extra stick effects through the shim** (airbrake buffet, high-speed buffet) as additional
   DirectInput effects on the stick Condor already drives.
 - **Stick via CLS2Sim** with the same effects (stall flutter, airbrake and high-speed buffet), each
@@ -140,6 +157,5 @@ and pause) and a fake CLS2Sim (`tests/mock_cls2sim.py`, validates every packet).
   position grows with airspeed, and the stick's free position drifts with speed (speed stability).
 - **Bridge writes the force profile itself** (`0x10`), removing CLS2Sim's 20% scale-factor floor
   so the load fades smoothly all the way to zero.
-- **Stall speed per glider**: Condor's yaw string flutters at the stall (visible at 60 Hz UDP data)
-  and separates stalled from normal flight well on average, but throws false hits on recoveries
-  and pull-ups; the shim's stall-shake feed is the better signal.
+- **Trim through the shim**: check whether Condor moves the spring offset with the trim lever; if not,
+  the shim can do the trim-tab model itself.

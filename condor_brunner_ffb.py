@@ -116,6 +116,7 @@ DEFAULTS = {
     "cls2sim_msg_id": False,          # True only if "Message Identifier" is ticked in CLS2Sim
     "cls2sim_timeout_s": 0.25,
     "axis_mask": 0x4,                 # Rudder (pilot). 0x4 also covers a copilot rudder.
+    "shim_udp_port": 55291,           # stick shim (dinput8.dll in Condor's folder) feed. 0 = off
 
     # --- loop ---
     "tick_hz": 30,
@@ -163,6 +164,9 @@ DEFAULTS = {
     "ground_roughness_gain": 1.0,     # force *= clamp(0.5 + gain*roughness, 0.3, 1.5)
 
     # --- airborne slow vibration channel: stall flutter (+ optional turbulence) ---
+    "stall_source": "auto",           # auto: Condor's own stall shake via the stick shim, else IAS
+    "condor_stall_full_gain": 2500,   # Condor shake level (0-10000) = full pedal flutter
+    "condor_stall_curve": 1.0,        # 1 = follow Condor's shake linearly
     "buffet_onset_kt": 36.0,          # 1 g flutter onset IAS. 0 = off. Calibrate per glider.
     "buffet_band_kt": 8.0,            # flutter builds to full this far below onset
     "buffet_curve": 1.6,              # ramp shape: 1 = linear, 2 = gentle start then builds
@@ -194,6 +198,8 @@ DEFAULTS = {
     "hs_buffet_force_max": 140,
     "hs_buffet_curve": 1.5,           # >1 = creeps in, then builds hard near VNE
     "hs_buffet_interval_ms": 28,
+    "condor_vne_force_max": 260,      # Condor's own VNE flutter (stick shim), on the pedals. 0 = off
+    "condor_vne_interval_ms": 50,
 
     # --- structural failure: Condor's stick flutter stops dead when a wing breaks ---
     "failure_detect": True,
@@ -266,11 +272,18 @@ SETTINGS_LAYOUT = [
       ("float_rate_per_s", "How fast the centre can move. Lower = smoother, higher = snappier."),
       ("float_sign", "CALIBRATION ONLY - verified for this rig. Leave at 1.")]),
     ("StallFlutter",
-     "Condor's UDP has no angle of attack, so this uses the physics equivalent: high AoA =\n"
-     "low airspeed for the g you're pulling. Flutter starts below an IAS that rises with g.\n"
-     "Calibrate: straight wings-level stall, note the IAS in the bridge window when the\n"
-     "stick starts to flutter, put it in buffet_onset_kt. Add a few kt with water ballast.",
-     [("buffet_onset_kt", "Flutter onset IAS at 1 g (kt). 0 = off. Set it to the IAS where\n"
+     "With the stick shim installed (install_stick_shim.bat), the pedals flutter with Condor's\n"
+     "OWN stall shake - the same moment and strength as the stick, right for every glider and\n"
+     "ballast. Without it, the IAS model below is used: high AoA = low airspeed for the g\n"
+     "you're pulling, so flutter starts below an IAS that rises with g.",
+     [("stall_source", "auto = Condor's stall shake when the stick shim is running, else the IAS\n"
+                       "model. condor = only Condor's shake. ias = always the IAS model."),
+      ("condor_stall_full_gain", "Condor's shake level (0-10000) that gives full pedal flutter. A\n"
+                                 "normal stall peaks around 2600 and settles at 1000-1800 while\n"
+                                 "stalled. Lower = pedals reach full flutter sooner."),
+      ("condor_stall_curve", "1 = pedal flutter follows Condor's shake linearly. 2 = lighter at\n"
+                             "first, full only at Condor's strongest shake."),
+      ("buffet_onset_kt", "Flutter onset IAS at 1 g (kt). 0 = off. Set it to the IAS where\n"
                           "the STICK starts to flutter; the pedals then fade in just after."),
       ("buffet_band_kt", "Flutter builds to full strength this many kt below onset."),
       ("buffet_curve", "Ramp shape. 1 = linear. 2 = barely-there at first, then builds to a\n"
@@ -316,7 +329,10 @@ SETTINGS_LAYOUT = [
       ("hs_buffet_full_kt", "Full strength at this IAS (kt) - put it near VNE."),
       ("hs_buffet_force_max", "Strength at full."),
       ("hs_buffet_curve", "Build-up shape. >1 = creeps in then builds hard near VNE. 1 = linear."),
-      ("hs_buffet_interval_ms", "Buzz period (ms). Lower = faster, finer buzz.")]),
+      ("hs_buffet_interval_ms", "Buzz period (ms). Lower = faster, finer buzz."),
+      ("condor_vne_force_max", "With the stick shim: Condor's own VNE flutter (it shakes the stick\n"
+                               "just before the wing goes) on the pedals, at full. 0 = off."),
+      ("condor_vne_interval_ms", "VNE flutter period (ms).")]),
     ("StructuralFailure",
      "When a wing comes off (Condor shows it as a violent, sustained roll at speed), all\n"
      "buzz and flutter stop instantly - like Condor's stick does - until the next flight.",
@@ -348,7 +364,9 @@ SETTINGS_LAYOUT = [
       ("cls2sim_port", "CLS2Sim remote-control UDP port."),
       ("cls2sim_msg_id", "true only if 'Message Identifier' is ticked in CLS2Sim settings."),
       ("cls2sim_timeout_s", "Reply timeout for CLS2Sim requests (s)."),
-      ("axis_mask", "Which Brunner axis to drive. 0x4 = rudder.")]),
+      ("axis_mask", "Which Brunner axis to drive. 0x4 = rudder."),
+      ("shim_udp_port", "UDP port the stick shim sends Condor's shake on (udp_port in\n"
+                        "ffb_shim.ini). 0 = ignore the shim.")]),
 ]
 
 RESTART_KEYS = {k for sec, _, keys in SETTINGS_LAYOUT if sec == "Network" for k, _ in keys}
@@ -598,6 +616,59 @@ class CondorIn:
         if t is None or t != self._last_time_val:   # sim clock moving = not paused
             self._last_time_val = t
             self.last_change = now
+
+
+class ShimIn:
+    """Condor's own stick shake, from the stick shim (dinput8.dll next to Condor.exe).
+    Every 50 ms it sends 'STATE seq=.. stall1=G stall2=G spring_k=K': G is the gain (0-10000)
+    Condor gives its pitch (Stall1) and roll (Stall2) shake effects. Both rise together in a
+    stall; Stall2 alone is Condor's VNE flutter. -1 = no such effect (yet)."""
+
+    def __init__(self, port, host="127.0.0.1"):
+        self.sock = None
+        self.stall1 = self.stall2 = self.spring_k = -1
+        self.last = -1e9
+        self.packets = 0
+        if port and port > 0:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                s.bind((host, port))
+                s.setblocking(False)
+                self.sock = s
+            except OSError as e:
+                print(f"[shim] can't listen on UDP {port} ({e}) - using the IAS stall model")
+                s.close()
+
+    def poll(self):
+        while self.sock:
+            try:
+                data, _ = self.sock.recvfrom(4096)
+            except (BlockingIOError, InterruptedError):
+                return
+            except OSError:
+                return
+            if b" STATE " not in data:
+                continue
+            vals = {}
+            for tok in data.decode("ascii", "replace").split():
+                if "=" in tok:
+                    k, v = tok.split("=", 1)
+                    try:
+                        vals[k] = int(v)
+                    except ValueError:
+                        pass
+            self.stall1 = vals.get("stall1", -1)
+            self.stall2 = vals.get("stall2", -1)
+            self.spring_k = vals.get("spring_k", -1)
+            self.last = time.monotonic()
+            self.packets += 1
+
+    def shake(self, now=None, max_age=1.0):
+        """(stall1, stall2) while the shim is alive and Condor has its shake effects, else None."""
+        now = time.monotonic() if now is None else now
+        if now - self.last > max_age or self.stall1 < 0 or self.stall2 < 0:
+            return None
+        return self.stall1, self.stall2
 
 
 # ----------------------------------------------------------------------------
@@ -967,7 +1038,8 @@ class ForceModel:
                        0, c["ground_vib_interval_slow_ms"], 0, c["turb_vib_interval_ms"],
                        move_back=0)
 
-    def update(self, s, dt, airbrake=0.0):
+    def update(self, s, dt, airbrake=0.0, shake=None):
+        """shake: (stall1, stall2) gains from the stick shim, or None."""
         c = self.c
         kt = self.ias(max(0.0, float(s.get("airspeed", 0.0))) * MS_TO_KT, dt)
 
@@ -1029,11 +1101,26 @@ class ForceModel:
         g = s.get("gforce")
         g = clamp(g, 0.3, 4.0) if isinstance(g, float) and g > 0 else 1.0
         onset = c["buffet_onset_kt"] * (math.sqrt(g) if c["buffet_g_scaling"] else 1.0)
+        src = str(c["stall_source"]).lower()
+        use_condor = shake is not None and src in ("auto", "condor")
+        stall_src = "condor" if use_condor else ("none" if src == "condor" else "ias")
+        vnef = 0.0
         if not on_ground:
             ts = s.get("turbulencestrength")
             turb = c["turb_vib_force_per_unit"] * ts if isinstance(ts, float) else 0.0
             buf = 0.0
-            if c["buffet_onset_kt"] > 0 and kt < onset:
+            if use_condor:
+                s1, s2 = shake
+                frac = clamp(s1 / max(1.0, float(c["condor_stall_full_gain"])), 0.0, 1.0)
+                if frac > 0:
+                    buf = c["buffet_force_max"] * frac ** max(0.1, c["condor_stall_curve"])
+                    stall_pct = frac * 100
+                    buzz = c["buffet_buzz_force_max"] * frac ** 3
+                    if buzz > 0:
+                        fast_f, fast_ms = buzz, c["buffet_buzz_interval_ms"]
+                if s1 < 50:               # roll shake on its own = Condor's VNE flutter
+                    vnef = c["condor_vne_force_max"] * clamp(s2 / 10000.0, 0.0, 1.0)
+            elif src != "condor" and c["buffet_onset_kt"] > 0 and kt < onset:
                 frac = clamp((onset - kt) / max(1e-6, c["buffet_band_kt"]), 0.0, 1.0)
                 fade_out = clamp((kt - 5.0) / 10.0, 0.0, 1.0)   # smooth to nothing 15 -> 5 kt
                 buf = c["buffet_force_max"] * frac ** max(0.1, c["buffet_curve"]) * fade_out
@@ -1061,18 +1148,19 @@ class ForceModel:
                        (low + (1 - low) * sp ** max(0.1, c["airbrake_vib_curve"])))
             slow_f, slow_ms = max((buf, c["buffet_interval_ms"]),
                                   (abf, c["airbrake_vib_interval_ms"]),
+                                  (vnef, c["condor_vne_interval_ms"]),
                                   (turb, c["turb_vib_interval_ms"]))
 
         self._check_structure(s, kt, on_ground, dt)
         if self.broken:                   # like Condor's stick: flutter stops the instant it breaks
             fast_f = slow_f = 0.0
-            hs = 0.0
+            hs = vnef = 0.0
         cap = c["vib_force_cap"]
         self.info = {"mode": "GROUND" if on_ground else "AIR", "kt": kt, "gs": gs,
                      "yaw_deg": math.degrees(yaw), "fade": fade, "g": g, "onset": onset,
                      "limp": self.limp, "load": eff_load,
                      "stall": stall_pct, "ab": airbrake, "hs": hs if not on_ground else 0.0,
-                     "broken": self.broken}
+                     "broken": self.broken, "src": stall_src, "vne": vnef}
         return Targets(sf, trim,
                        int(clamp(fast_f, 0, cap)), int(max(1, fast_ms)),
                        int(clamp(slow_f, 0, cap)), int(max(10, slow_ms)),
@@ -1417,6 +1505,7 @@ def run_record(cfg, out_path):
     condor = CondorIn(cfg["condor_listen_host"], cfg["condor_listen_port"], cfg["forward_to"])
     print("RECORDING all Condor UDP data. Close run.bat first (same port).")
     lever = AirbrakeLever(cfg)
+    shim = ShimIn(cfg["shim_udp_port"])
     joy, joy_ids = None, []
     try:
         joy = WinJoy()
@@ -1439,6 +1528,11 @@ def run_record(cfg, out_path):
             now = time.monotonic()
             st = dict(condor.state)
             st["lever_airbrake"] = round(lever.position(), 4)
+            shim.poll()
+            live_shim = shim.shake(now) is not None
+            st["shim_stall1"] = shim.stall1 if live_shim else ""
+            st["shim_stall2"] = shim.stall2 if live_shim else ""
+            st["shim_spring_k"] = shim.spring_k if live_shim else ""
             for jid in joy_ids:
                 r = joy.read(jid)
                 if r:
@@ -1476,6 +1570,8 @@ def run_record(cfg, out_path):
 
 def run_bridge(cfg, dry_run=False, watcher=None, max_seconds=0.0):
     condor = CondorIn(cfg["condor_listen_host"], cfg["condor_listen_port"], cfg["forward_to"])
+    shim = ShimIn(cfg["shim_udp_port"])
+    shim_live = False
     model = ForceModel(cfg)
     lever = AirbrakeLever(cfg)
     cls = out = None
@@ -1512,9 +1608,15 @@ def run_bridge(cfg, dry_run=False, watcher=None, max_seconds=0.0):
                     model.yaw.tau = cfg["yaw_tau_s"]
                     print("\n[settings] applied: " + "; ".join(changed))
             condor.poll()
+            shim.poll()
+            shake = shim.shake(now)
+            if (shake is not None) != shim_live:
+                shim_live = shake is not None
+                print("\n[shim] " + ("stick shim live - pedals flutter with Condor's own stall shake"
+                                     if shim_live else "stick shim quiet - back to the IAS stall model"))
             live = condor.packets and (now - condor.last_change) < cfg["stale_after_s"]
             ab = lever.position()
-            t = model.update(condor.state, period, ab) if live else model.neutral(period)
+            t = model.update(condor.state, period, ab, shake) if live else model.neutral(period)
 
             if out:
                 if connected:
@@ -1549,8 +1651,10 @@ def run_bridge(cfg, dry_run=False, watcher=None, max_seconds=0.0):
                     line = (f"{i['mode']:6s} IAS {i['kt']:5.1f}kt {i['g']:3.1f}g | load {load} | "
                             f"yaw {i['yaw_deg']:+5.1f}deg -> trim {t.trim:+.3f} | "
                             f"rumble {t.fast_f:3d} | flutter {t.slow_f:3d} "
-                            f"stall {i.get('stall', 0):3.0f}% (onset {i['onset']:3.0f}kt) | "
+                            f"stall {i.get('stall', 0):3.0f}% "
+                            f"({'condor' if i.get('src') == 'condor' else 'onset %3.0fkt' % i['onset']}) | "
                             f"brakes {i.get('ab', 0) * 100:3.0f}% | hi-spd {i.get('hs', 0):3.0f}"
+                            f"{' | VNE flutter %3.0f' % i['vne'] if i.get('vne') else ''}"
                             f"{' | WING GONE' if i.get('broken') else ''}")
                 errs = f" err {cls.total_fail}" if cls and cls.total_fail else ""
                 print(f"\r{line} |{pos_txt}{errs}   ", end="", flush=True)
