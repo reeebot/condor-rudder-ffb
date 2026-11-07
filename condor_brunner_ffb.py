@@ -1410,10 +1410,12 @@ def run_airbrake_test(cfg, out_path, lead=10.0, open_s=8.0, closed_s=8.0, cycles
 
 
 def run_record(cfg, out_path):
-    """Record every Condor UDP field to CSV until Ctrl+C (for offline analysis)."""
+    """Record every Condor UDP field (+ airbrake lever + controller axes) to CSV.
+    Rows are written as they arrive and flushed every second, so closing the window
+    loses at most the last second."""
+    import csv
     condor = CondorIn(cfg["condor_listen_host"], cfg["condor_listen_port"], cfg["forward_to"])
-    print("RECORDING all Condor UDP data. Close run_ffb.bat first (same port).")
-    print("Tip: SendIntervalMs=10 in Condor's UDP.ini records at 100 Hz (catches buffet).")
+    print("RECORDING all Condor UDP data. Close run.bat first (same port).")
     lever = AirbrakeLever(cfg)
     joy, joy_ids = None, []
     try:
@@ -1425,46 +1427,50 @@ def run_record(cfg, out_path):
     except Exception as e:
         print(f"  (not recording controller axes: {e})")
     print("Waiting for Condor data - start a flight...")
-    rows, last_pk, t0 = [], 0, None
+    f = w = cols = None
+    n, last_pk, t0, last_flush, t_last = 0, 0, None, 0.0, 0.0
     try:
         while True:
             condor.poll()
-            if condor.packets != last_pk:
-                last_pk = condor.packets
-                now = time.monotonic()
-                if t0 is None:
-                    t0 = now
-                    print("Recording... press Ctrl+C here when done.")
-                st = dict(condor.state)
-                st["lever_airbrake"] = round(lever.position(), 4)
-                for jid in joy_ids:
-                    r = joy.read(jid)
-                    if r:
-                        for ax, v in r.items():
-                            st[f"joy{jid}_{ax}"] = v
-                rows.append((now - t0, st))
-                if len(rows) % 100 == 0:
-                    ias = condor.state.get("airspeed")
-                    ias = f"{ias * MS_TO_KT:5.1f} kt" if isinstance(ias, float) else "?"
-                    print(f"\r  {now - t0:6.1f} s  {len(rows):6d} samples  IAS {ias}   ",
-                          end="", flush=True)
-            else:
+            if condor.packets == last_pk:
                 time.sleep(0.002)
+                continue
+            last_pk = condor.packets
+            now = time.monotonic()
+            st = dict(condor.state)
+            st["lever_airbrake"] = round(lever.position(), 4)
+            for jid in joy_ids:
+                r = joy.read(jid)
+                if r:
+                    for ax, v in r.items():
+                        st[f"joy{jid}_{ax}"] = v
+            if f is None:
+                t0 = now
+                cols = sorted(st)
+                f = open(out_path, "w", newline="", encoding="utf-8")
+                w = csv.writer(f)
+                w.writerow(["t_s"] + cols)
+                print(f"Recording to {out_path} ... press Ctrl+C here when done.")
+            t_last = now - t0
+            w.writerow([f"{t_last:.3f}"] + [st.get(k, "") for k in cols])
+            n += 1
+            if now - last_flush >= 1.0:
+                last_flush = now
+                f.flush()
+                ias = st.get("airspeed")
+                ias = f"{ias * MS_TO_KT:5.1f} kt" if isinstance(ias, float) else "?"
+                print(f"\r  {t_last:6.1f} s  {n:6d} samples (~{n / max(t_last, 1e-6):3.0f} Hz)  IAS {ias}   ",
+                      end="", flush=True)
     except KeyboardInterrupt:
         pass
+    finally:
+        if f:
+            f.close()
     print()
-    if not rows:
+    if not n:
         print("Nothing recorded.")
         return
-    import csv
-    keys = sorted({k for _, st in rows for k in st})
-    with open(out_path, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(["t_s"] + keys)
-        for tr, st in rows:
-            w.writerow([f"{tr:.3f}"] + [st.get(k, "") for k in keys])
-    rate = len(rows) / max(1e-6, rows[-1][0])
-    print(f"Saved {len(rows)} samples ({rows[-1][0]:.0f} s, ~{rate:.0f} Hz) to: {out_path}")
+    print(f"Saved {n} samples ({t_last:.0f} s, ~{n / max(t_last, 1e-6):.0f} Hz) to: {out_path}")
     print("I can read it straight from this folder - just tell me it's done.")
 
 
