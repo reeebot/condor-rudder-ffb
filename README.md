@@ -26,6 +26,30 @@ Python 3.8+, standard library only. Windows.
 
 Everything is tunable in `settings.ini`, and **changes apply live** while you fly.
 
+## Stick: stronger Condor force feedback (shim)
+
+Condor's own stick force feedback is good but soft, and Condor has no strength setting. The
+`stick_shim` is a small stand-in `dinput8.dll` that sits next to `Condor.exe`. Condor loads it
+instead of Windows' DirectInput; it loads the real one and passes everything straight through,
+except the force-feedback commands, which it multiplies by the percentages in `ffb_shim.ini`
+(spring, shake, damper, constant). Edits apply within half a second, mid-flight.
+
+- **No input lag**: stick axes and buttons never go through it, only force commands do.
+- **Log**: `ffb_shim.log` in the Condor folder lists every effect Condor creates, changes, starts
+  and stops (Condor's names from `Effects.ffe`, real Unix-ms timestamps that line up with the
+  `wall_ms` column of `record_flight.bat` recordings). `CLIPPED` means the boost hit the stick's
+  maximum.
+- **Bridge feed**: each log line also goes out over UDP to `127.0.0.1:55291`, so the pedal bridge can
+  follow Condor's own stall and VNE shake.
+- **Install**: `install_stick_shim.bat` (Condor in `C:\Condor3`; pass another folder as the first
+  argument). **Uninstall**: `uninstall_stick_shim.bat` - deletes the one DLL.
+- Unknown whether Condor's online file validation minds an extra DLL in its folder: try it offline
+  first.
+
+Build: `stick_shim/build.sh` (zig's bundled clang targeting 32-bit Windows, since Condor.exe is
+x86). Test: `stick_shim/test/run_wine_test.sh` runs it under 32-bit wine against a fake DirectInput
+and checks the scaling, live reload, log and UDP feed.
+
 ## Setup
 
 **1. Condor** - `<Condor install>\UDP.ini`
@@ -65,6 +89,7 @@ No virtual COM port needed. Keep Condor's own force feedback on for the stick.
 | `lever_setup.bat` | Finds your airbrake lever and saves it to `settings.ini`. |
 | `airbrake_test.bat` | Beep-guided test that checks whether Condor sends an airbrake field. (It doesn't.) |
 | `record_flight.bat` | Records everything Condor sends, plus the airbrake lever and every controller axis (stick, trim lever...), to `condor_record.csv` until Ctrl+C. |
+| `install_stick_shim.bat` / `uninstall_stick_shim.bat` | Put the stick FFB shim into Condor's folder, or take it out. |
 
 Command line: `python condor_brunner_ffb.py --help` (also `--selftest`, `--dump`, `--dry-run`).
 `run.bat` and the test/record tools share UDP port 55278, so run one at a time.
@@ -103,6 +128,10 @@ and pause) and a fake CLS2Sim (`tests/mock_cls2sim.py`, validates every packet).
 
 ## Roadmap
 
+- **Pedals follow Condor's own stall shake** from the shim's UDP feed, instead of estimating the stall
+  from airspeed, so every glider and ballast state is right automatically.
+- **Extra stick effects through the shim** (airbrake buffet, high-speed buffet) as additional
+  DirectInput effects on the stick Condor already drives.
 - **Stick via CLS2Sim** with the same effects (stall flutter, airbrake and high-speed buffet), each
   with its own onset and strength per axis - the stick can feel the stall sooner or harder than the
   pedals.
@@ -111,6 +140,6 @@ and pause) and a fake CLS2Sim (`tests/mock_cls2sim.py`, validates every packet).
   position grows with airspeed, and the stick's free position drifts with speed (speed stability).
 - **Bridge writes the force profile itself** (`0x10`), removing CLS2Sim's 20% scale-factor floor
   so the load fades smoothly all the way to zero.
-- **Stall speed per glider** (in progress): look for the stall buffet in Condor's motion data at
-  100 Hz so it adapts to every glider automatically; fallback is a per-glider table plus automatic
-  water-ballast adjustment.
+- **Stall speed per glider**: Condor's yaw string flutters at the stall (visible at 60 Hz UDP data)
+  and separates stalled from normal flight well on average, but throws false hits on recoveries
+  and pull-ups; the shim's stall-shake feed is the better signal.

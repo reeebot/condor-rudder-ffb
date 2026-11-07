@@ -1449,10 +1449,10 @@ def run_record(cfg, out_path):
                 cols = sorted(st)
                 f = open(out_path, "w", newline="", encoding="utf-8")
                 w = csv.writer(f)
-                w.writerow(["t_s"] + cols)
+                w.writerow(["t_s", "wall_ms"] + cols)
                 print(f"Recording to {out_path} ... press Ctrl+C here when done.")
             t_last = now - t0
-            w.writerow([f"{t_last:.3f}"] + [st.get(k, "") for k in cols])
+            w.writerow([f"{t_last:.3f}", int(time.time() * 1000)] + [st.get(k, "") for k in cols])
             n += 1
             if now - last_flush >= 1.0:
                 last_flush = now

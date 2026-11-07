@@ -2,3 +2,7 @@ settings.ini
 *.csv
 __pycache__/
 *.pyc
+stick_shim/test/*.exe
+stick_shim/test/*.dll
+stick_shim/test/*.lib
+stick_shim/test/*.pdb
