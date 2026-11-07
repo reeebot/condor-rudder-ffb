@@ -5,7 +5,8 @@ Usage: python mock_cls2sim.py PORT LOGFILE [mid]   (add "mid" for Message Identi
 import socket, struct, sys, json, time
 port = int(sys.argv[1]); log = open(sys.argv[2], "a"); MID = len(sys.argv) > 3
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(("127.0.0.1", port))
-SET_FMT = {0x40: "B", 0x20: "H", 0x90: "f", 0xC0: "B", 0xC1: "I", 0xC2: "I", 0xC3: "I", 0xC4: "I"}
+SET_FMT = {0x40: "B", 0x20: "H", 0x90: "f", 0xC0: "B", 0xC1: "I", 0xC2: "I", 0xC3: "I", 0xC4: "I",
+           0xE2: "ff"}
 state = {"trim": 0.0, "pos": 0.0}
 def reply(body=b"", status=0):
     pkt = struct.pack("<B", status) + body
@@ -30,6 +31,9 @@ while True:
             if sid == 0x20 and not (20 <= v <= 999): rec["bad"] = "scale out of range"
             if sid == 0x90 and not (-1 <= v <= 1): rec["bad"] = "trim out of range"
             if sid == 0xC3 and v < 10: rec["bad"] = "slow interval < 10"
+            if sid == 0xE2:
+                lim = struct.unpack_from("<ff", d, 12)[1]
+                if v < 0 or lim < 0: rec["bad"] = "negative damping"
     elif cmd == 0xD1:
         axis, oid = struct.unpack_from("<II", d, 4); rec.update(axis=axis, oid=oid)
         if len(d) != 12: st = 4; rec["bad"] = "override len"

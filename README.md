@@ -17,10 +17,11 @@ Python 3.8+, standard library only. Windows.
 | Effect | How it's modelled |
 |---|---|
 | **Airflow load** | No spring. Stopped or slow, the pedals are limp and stay where you put them. From ~3 kt the airflow centres them, building with airspeed; above 70 kt (about ¾ of max) it keeps rising more gently up to ~133 kt. |
+| **Linkage** | The cables still move the rudder's mass: some resistance even parked (no centring), plus damping against quick pedal movements that grows with airspeed (CLS2Sim friction-by-velocity). |
 | **Yaw feel** | The pedal you push pushes back harder the further you yaw (driven by Condor's yaw string). |
 | **Stall flutter** | With the stick shim installed, the pedals flutter with **Condor's own stall shake**: same moment and strength as the stick, right for every glider and ballast. Without it: IAS below stall onset × √g. Plus a faster buzz deep in the stall. |
 | **Airbrake buffet** | Condor doesn't send airbrake position, so the bridge reads your airbrake lever directly. Already strong by ~60 kt (about 80%), full at 110 kt. |
-| **Structural failure** | When a wing comes off (a violent, sustained roll at speed), every buzz and flutter stops instantly, like Condor's stick does, until the next flight. |
+| **Structural failure** | When a wing comes off (the shim sees Condor cut its VNE flutter, or a violent sustained roll at speed), the flutter drops suddenly to 40% - the tail and the other wing are still in the airflow - and fades as you slow down. |
 | **High-speed buffet** | A fine buzz that creeps in above 115 kt and builds hard toward VNE (145 kt by default; set it per glider). With the shim, Condor's own VNE flutter comes through too. |
 | **Ground rumble** | Scales with ground speed and Condor's surface roughness. |
 
@@ -48,7 +49,16 @@ So the shim scales:
 
 - `spring`: the stiffness. Past the 100% cap an **assist spring** on the same axes carries the
   rest, so the boost still works at high speed (`spring_assist=0` turns that off).
-- `shake`: the shake effects' gain, spilling into the magnitude once the gain is at 100%.
+- `shake`: the shake effects' gain, spilling into the magnitude once the gain is at 100%
+  (`shake_curve` below 1 brings the first light buffet through stronger).
+
+And adds two things Condor doesn't do:
+
+- **Linkage** (`[Linkage]`): friction, inertia and damping effects of its own on the stick axes,
+  always on, so moving the stick means moving cables and control surfaces with mass even when
+  parked. The damping grows with airspeed (read from Condor's spring stiffness).
+- **Wing break** (`[Break]`): when Condor cuts its VNE flutter dead (the wing just broke), the shim
+  keeps 40% of it going, fading with airspeed, instead of going silent.
 
 - **No input lag**: stick axes and buttons never go through it, only force commands do.
 - **Log**: `ffb_shim.log` in the Condor folder lists every effect Condor creates, changes, starts

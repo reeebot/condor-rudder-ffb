@@ -10,6 +10,10 @@
  *               axes carries the rest, so the boost keeps working at high speed
  *       shake:  Condor drives its stall/VNE shake with the effect gain, so that is what we
  *               scale (spilling into the magnitude once the gain is maxed)
+ *   - linkage: friction, inertia and damping effects of our own on the stick, so moving it
+ *     always means moving cables and a control surface with mass (more damping with speed)
+ *   - wing break: Condor cuts its VNE flutter dead; we keep a share of it going (the other
+ *     wing and the tail still flutter), fading as the airspeed drops
  *   - every effect Condor creates, changes, starts or stops is written to ffb_shim.log and
  *     sent as one text line over UDP to 127.0.0.1 (so the pedal bridge can follow Condor's
  *     own stall/VNE shake)
@@ -27,8 +31,10 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
+#include <stdlib.h>
+#include <math.h>
 
-#define SHIM_VERSION "0.2"
+#define SHIM_VERSION "0.3"
 
 /* ------------------------------------------------------------------ vtable slots */
 enum { DI8_CreateDevice = 3 };
@@ -50,8 +56,12 @@ static int g_wide;
 typedef struct {
     int spring, damper, shake, constant, master, spring_assist;
     int log, log_setp, max_mb, udp_port;
+    double shake_curve;
+    int break_residual;
+    int link_friction, link_inertia, link_damper, link_damper_speed;
 } Cfg;
-static Cfg g_cfg = {100, 100, 100, 100, 100, 1, 1, 1, 50, 55291};
+static Cfg g_cfg = {100, 100, 100, 100, 100, 1, 1, 1, 50, 55291, 1.0, 0, 0, 0, 0, 0};
+static unsigned g_setp_calls;
 static FILETIME g_ini_mtime;
 static DWORD g_ini_check;
 
@@ -169,6 +179,14 @@ static Fx *fx_add(void *p)
     f->id = g_next_id++;
     return f;
 }
+
+static Fx *latest_named(const char *name);
+
+/* wing-break residual: Condor cuts its VNE flutter dead when the wing goes; we keep some */
+static struct { int active; void *obj; DWORD level; LONG k_break; DWORD t0; DWORD sent; void *zero; } g_brk;
+/* linkage effects of our own: 0 friction, 1 inertia, 2 damper */
+static struct { void *obj; void *dev; LONG sent; int fails; int started; } g_link[3];
+static int g_link_restart, g_link_drop;
 
 /* effects found in Effects.ffe, so the log can show Condor's own names */
 typedef struct { int sub; DWORD period; char name[64]; } FileFx;
@@ -290,11 +308,24 @@ static void read_cfg(int announce)
     c.log_setp = GetPrivateProfileIntA("Log", "log_changes", 1, ini) != 0;
     c.max_mb = clampi(GetPrivateProfileIntA("Log", "max_mb", 50, ini), 1, 2000);
     c.udp_port = clampi(GetPrivateProfileIntA("Bridge", "udp_port", 55291, ini), 0, 65535);
+    {
+        char b[32];
+        GetPrivateProfileStringA("Gain", "shake_curve", "1.0", b, sizeof b, ini);
+        c.shake_curve = atof(b);
+        if (c.shake_curve < 0.2 || c.shake_curve > 5.0) c.shake_curve = 1.0;
+    }
+    c.break_residual = clampi(GetPrivateProfileIntA("Break", "residual", 40, ini), 0, 100);
+    c.link_friction = clampi(GetPrivateProfileIntA("Linkage", "friction", 0, ini), 0, 100);
+    c.link_inertia = clampi(GetPrivateProfileIntA("Linkage", "inertia", 0, ini), 0, 100);
+    c.link_damper = clampi(GetPrivateProfileIntA("Linkage", "damper", 0, ini), 0, 100);
+    c.link_damper_speed = clampi(GetPrivateProfileIntA("Linkage", "damper_airspeed", 0, ini), 0, 100);
     g_cfg = c;
     if (announce)
-        emit(0, "CONFIG spring=%d spring_assist=%d damper=%d shake=%d constant=%d master=%d log=%d "
-             "log_changes=%d udp_port=%d", c.spring, c.spring_assist, c.damper, c.shake, c.constant, c.master,
-             c.log, c.log_setp, c.udp_port);
+        emit(0, "CONFIG spring=%d spring_assist=%d shake=%d shake_curve=%.2f damper=%d constant=%d master=%d "
+             "break_residual=%d linkage: friction=%d inertia=%d damper=%d damper_airspeed=%d log=%d log_changes=%d "
+             "udp_port=%d", c.spring, c.spring_assist, c.shake, c.shake_curve, c.damper, c.constant, c.master,
+             c.break_residual, c.link_friction, c.link_inertia, c.link_damper, c.link_damper_speed, c.log,
+             c.log_setp, c.udp_port);
 }
 
 static void maybe_reload(void)
@@ -470,7 +501,7 @@ static int scale_periodic(Fx *f, LPCDIEFFECT in, DWORD flags, Scaled *out, DWORD
     if (!src) return 0;
     base_gain = (flags & DIEP_GAIN) ? in->dwGain : f->gain;
     base_mag = src->dwMagnitude;
-    want = base_gain * (double)pct / 100.0;
+    want = 10000.0 * pow(base_gain / 10000.0, g_cfg.shake_curve) * (double)pct / 100.0;
     g2 = want >= 10000.0 ? 10000 : (DWORD)(want + 0.5);
     m = base_mag * (g2 > 0 && want > 10000.0 ? want / g2 : 1.0);
     m2 = m >= 10000.0 ? 10000 : (DWORD)(m + 0.5);
@@ -636,6 +667,30 @@ static void sync_assist(Fx *f)
     }
 }
 
+/* --- wing break helpers (call with g_cs held) */
+static LONG spring_k_now(void)
+{
+    Fx *sp = latest_named("Spring");
+    return sp && sp->ts_len >= sizeof(DICONDITION) ? ((DICONDITION *)sp->ts)->lPositiveCoefficient : -1;
+}
+
+static DWORD residual_gain(void)
+{
+    LONG k = spring_k_now();
+    double frac = (g_brk.k_break > 0 && k >= 0) ? (double)k / g_brk.k_break : 0.0;
+    if (frac > 1.0) frac = 1.0;
+    if (frac < 0.0) frac = 0.0;
+    return (DWORD)(g_brk.level * g_cfg.break_residual / 100.0 * frac + 0.5);
+}
+
+static void brk_clear(const char *why, int send_zero)
+{
+    if (!g_brk.active) return;
+    if (send_zero && g_brk.sent) g_brk.zero = g_brk.obj;
+    g_brk.active = 0;
+    emit(0, "BREAK residual off (%s)", why);
+}
+
 static HRESULT WINAPI Hook_SetParameters(void *self, LPCDIEFFECT peff, DWORD flags)
 {
     PFN_SetParameters orig;
@@ -648,12 +703,40 @@ static HRESULT WINAPI Hook_SetParameters(void *self, LPCDIEFFECT peff, DWORD fla
     int n;
     EnterCriticalSection(&g_cs);
     maybe_reload();
+    g_setp_calls++;
     orig = (PFN_SetParameters)orig_of(self, FX_SetParameters);
     f = fx_find(self);
     if (f && peff) {
         periodic = IS_PERIODIC(f->sub);
-        use = periodic ? scale_periodic(f, peff, flags, &s, &g2, &m2, &clip)
-                       : make_scaled(f->sub, peff, flags, &s, &clip);
+        if (periodic && (flags & DIEP_GAIN)) {
+            Fx *s1 = latest_named("Stall1");
+            DWORD s1g = (s1 && s1 != f) ? s1->gain : 0;
+            if (g_brk.active && peff->dwGain > 0) {
+                brk_clear("Condor is shaking the stick again", 0);
+            } else if (!g_brk.active && g_cfg.break_residual > 0 && !strcmp(f->name, "Stall2") &&
+                       f->gain >= 3000 && peff->dwGain == 0 && s1g < 50) {
+                g_brk.active = 1;
+                g_brk.obj = self;
+                g_brk.level = f->dev_gain;
+                g_brk.k_break = spring_k_now();
+                g_brk.t0 = GetTickCount();
+                g_brk.sent = 0;
+                g_brk.zero = NULL;
+                emit(0, "BREAK Condor cut its VNE flutter dead (gain %lu -> 0): keeping %d%% of it, fading with "
+                     "airspeed (spring k %ld)", (unsigned long)f->gain, g_cfg.break_residual, (long)g_brk.k_break);
+            }
+            if (g_brk.active && self == g_brk.obj && peff->dwGain == 0 && copy_effect(peff, &s, flags)) {
+                g2 = residual_gain();
+                m2 = f->dev_mag;
+                s.e.dwGain = g2;
+                s.flags = flags | DIEP_GAIN;
+                g_brk.sent = g2;
+                use = 1;
+            }
+        }
+        if (!use)
+            use = periodic ? scale_periodic(f, peff, flags, &s, &g2, &m2, &clip)
+                           : make_scaled(f->sub, peff, flags, &s, &clip);
         if (!use) s.flags = flags;
     }
     LeaveCriticalSection(&g_cs);
@@ -737,6 +820,7 @@ static HRESULT WINAPI Hook_Start(void *self, DWORD iter, DWORD flags)
     if (f && SUCCEEDED(hr)) {
         f->running = 1;
         assist = f->assist;
+        if (f->sub == 7) g_link_restart = 1;
     }
     emit(0, "START fx=%d %s %s iter=%lu flags=0x%lx hr=0x%08lx", f ? f->id : -1, f ? f->name : "?",
          sub_name(f ? f->sub : -1), (unsigned long)iter, (unsigned long)flags, (unsigned long)hr);
@@ -809,6 +893,7 @@ static void drop_assists(void *dev)
             g_fx[i].assist_ts_len = 0;
         }
     if (nd) rel = (PFN_Release)orig_of(dead[0], FX_Release);
+    g_link_drop = 1;                  /* the heartbeat thread lets go of the linkage effects */
     LeaveCriticalSection(&g_cs);
     for (i = 0; i < nd; i++) if (rel) rel(dead[i]);
 }
@@ -823,6 +908,174 @@ static Fx *latest_named(const char *name)
     return best;
 }
 
+static const GUID GUID_Friction_ = {0x13541C2A, 0x8E33, 0x11D0, {0x9A, 0xD0, 0x00, 0xA0, 0xC9, 0xA0, 0x6E, 0x35}};
+static const GUID GUID_Inertia_ = {0x13541C29, 0x8E33, 0x11D0, {0x9A, 0xD0, 0x00, 0xA0, 0xC9, 0xA0, 0x6E, 0x35}};
+static const GUID GUID_Damper_ = {0x13541C28, 0x8E33, 0x11D0, {0x9A, 0xD0, 0x00, 0xA0, 0xC9, 0xA0, 0x6E, 0x35}};
+static const char *LINK_NAME[3] = {"friction", "inertia", "damper"};
+
+static void set_gain_now(void *fx, DWORD gain)
+{
+    DIEFFECT e;
+    PFN_SetParameters sp = (PFN_SetParameters)orig_of(fx, FX_SetParameters);
+    memset(&e, 0, sizeof e);
+    e.dwSize = sizeof e;
+    e.dwGain = gain;
+    if (sp) sp(fx, &e, DIEP_GAIN);
+}
+
+/* Runs on the heartbeat thread every 50 ms: wing-break residual and the linkage effects.
+ * State is read under g_cs; DirectInput is only called with the lock released. */
+static void maintain(void)
+{
+    void *bobj = NULL, *zobj = NULL, *dev = NULL, *drop[3] = {NULL, NULL, NULL};
+    DWORD bgain = 0;
+    LONG want[3] = {0, 0, 0};
+    int act[3] = {0, 0, 0};          /* 1 create, 2 update, 3 start, 4 stop */
+    int i, running = 0, restart;
+    DIEFFECT base;
+    DWORD axes[4];
+    LONG dirs[4];
+    DICONDITION cond[4];
+    Fx *sp;
+
+    EnterCriticalSection(&g_cs);
+    maybe_reload();                   /* ini edits apply even while Condor sends nothing */
+    /* wing-break residual follows airspeed (Condor's spring stiffness is proportional to it) */
+    if (g_brk.active) {
+        Fx *bf = fx_find(g_brk.obj);
+        LONG k = spring_k_now();
+        if (!bf) brk_clear("effect gone", 0);
+        else if (GetTickCount() - g_brk.t0 > 120000) brk_clear("2 minutes", 1);
+        else if (g_brk.k_break > 0 && k >= 0 && k * 10 < g_brk.k_break) brk_clear("slowed right down", 1);
+        else {
+            DWORD r = residual_gain();
+            if ((r > g_brk.sent ? r - g_brk.sent : g_brk.sent - r) >= 100) {
+                bobj = g_brk.obj;
+                bgain = r;
+                g_brk.sent = r;
+                bf->dev_gain = r;
+            }
+        }
+    }
+    if (g_brk.zero && fx_find(g_brk.zero)) zobj = g_brk.zero;
+    g_brk.zero = NULL;
+
+    /* linkage effects ride on the same axes as Condor's spring */
+    sp = latest_named("Spring");
+    restart = g_link_restart;
+    g_link_restart = 0;
+    if (g_link_drop) {
+        for (i = 0; i < 3; i++) { drop[i] = g_link[i].obj; g_link[i].obj = NULL; g_link[i].started = 0; }
+        g_link_drop = 0;
+    }
+    if (sp && sp->dev && sp->base.cAxes > 0) {
+        LONG k = sp->ts_len >= sizeof(DICONDITION) ? ((DICONDITION *)sp->ts)->lPositiveCoefficient : 0;
+        DWORD n = sp->base.cAxes;
+        running = sp->running;
+        dev = sp->dev;
+        base = sp->base;
+        memcpy(axes, sp->axes, sizeof axes);
+        memcpy(dirs, sp->dirs, sizeof dirs);
+        want[0] = g_cfg.link_friction * 100;
+        want[1] = g_cfg.link_inertia * 100;
+        want[2] = (LONG)((g_cfg.link_damper + g_cfg.link_damper_speed * (k > 0 ? k : 0) / 10000.0) * 100.0);
+        for (i = 0; i < 3; i++) {
+            if (want[i] > 10000) want[i] = 10000;
+            if (g_link[i].obj && g_link[i].dev != dev) {      /* Condor recreated its effects */
+                drop[i] = g_link[i].obj;
+                g_link[i].obj = NULL;
+                g_link[i].started = 0;
+            }
+            if (!g_link[i].obj) {
+                if (want[i] > 0 && running && g_link[i].fails < 3) act[i] = 1;
+            } else if ((want[i] > g_link[i].sent ? want[i] - g_link[i].sent : g_link[i].sent - want[i]) >= 50 ||
+                       (want[i] == 0 && g_link[i].sent != 0)) {
+                act[i] = 2;
+            } else if (running && (!g_link[i].started || restart)) {
+                act[i] = 3;
+            } else if (!running && g_link[i].started) {
+                act[i] = 4;
+            }
+        }
+        for (i = 0; i < (int)n && i < 4; i++) {
+            memset(&cond[i], 0, sizeof cond[i]);
+            cond[i].dwPositiveSaturation = cond[i].dwNegativeSaturation = 10000;
+        }
+        base.dwSize = sizeof(DIEFFECT);
+        base.rgdwAxes = axes;
+        base.rglDirection = dirs;
+        base.lpEnvelope = NULL;
+        base.dwGain = 10000;
+        base.dwDuration = INFINITE;
+        base.dwTriggerButton = DIEB_NOTRIGGER;
+        base.cbTypeSpecificParams = n * sizeof(DICONDITION);
+        base.lpvTypeSpecificParams = cond;
+    } else {
+        for (i = 0; i < 3; i++)
+            if (g_link[i].obj) { drop[i] = g_link[i].obj; g_link[i].obj = NULL; g_link[i].started = 0; }
+    }
+    LeaveCriticalSection(&g_cs);
+
+    if (bobj) set_gain_now(bobj, bgain);
+    if (zobj) set_gain_now(zobj, 0);
+    for (i = 0; i < 3; i++) {
+        if (drop[i]) {
+            PFN_Release rel = (PFN_Release)orig_of(drop[i], FX_Release);
+            if (rel) rel(drop[i]);
+        }
+    }
+    for (i = 0; i < 3; i++) {
+        DWORD a;
+        HRESULT hr = DI_OK;
+        if (!act[i]) continue;
+        for (a = 0; a < base.cAxes && a < 4; a++)
+            cond[a].lPositiveCoefficient = cond[a].lNegativeCoefficient = want[i];
+        if (act[i] == 1) {
+            PFN_CreateEffect ce = (PFN_CreateEffect)orig_of(dev, DEV_CreateEffect);
+            LPDIRECTINPUTEFFECT o = NULL;
+            const GUID *g = i == 0 ? &GUID_Friction_ : i == 1 ? &GUID_Inertia_ : &GUID_Damper_;
+            hr = ce ? ce(dev, g, &base, &o, NULL) : DIERR_GENERIC;
+            if (SUCCEEDED(hr) && o) {
+                PFN_Start st = (PFN_Start)orig_of(o, FX_Start);
+                HRESULT h2 = st ? st(o, 1, 0) : DIERR_GENERIC;
+                EnterCriticalSection(&g_cs);
+                g_link[i].obj = o;
+                g_link[i].dev = dev;
+                g_link[i].sent = want[i];
+                g_link[i].started = SUCCEEDED(h2);
+                emit(0, "LINKAGE %s created at %ld (start hr=0x%08lx)", LINK_NAME[i], (long)want[i], (unsigned long)h2);
+                LeaveCriticalSection(&g_cs);
+            } else {
+                EnterCriticalSection(&g_cs);
+                g_link[i].fails++;
+                emit(0, "LINKAGE %s create FAILED hr=0x%08lx (try %d of 3) - the stick may not support it",
+                     LINK_NAME[i], (unsigned long)hr, g_link[i].fails);
+                LeaveCriticalSection(&g_cs);
+            }
+        } else if (act[i] == 2) {
+            void *o = g_link[i].obj;
+            PFN_SetParameters spf = (PFN_SetParameters)orig_of(o, FX_SetParameters);
+            hr = spf ? spf(o, &base, DIEP_TYPESPECIFICPARAMS) : DIERR_GENERIC;
+            EnterCriticalSection(&g_cs);
+            if (SUCCEEDED(hr)) g_link[i].sent = want[i];
+            else emit(0, "LINKAGE %s update FAILED hr=0x%08lx", LINK_NAME[i], (unsigned long)hr);
+            LeaveCriticalSection(&g_cs);
+        } else if (act[i] == 3 || act[i] == 4) {
+            void *o = g_link[i].obj;
+            if (act[i] == 3) {
+                PFN_Start st = (PFN_Start)orig_of(o, FX_Start);
+                hr = st ? st(o, 1, 0) : DIERR_GENERIC;
+            } else {
+                PFN_Stop sto = (PFN_Stop)orig_of(o, FX_Stop);
+                hr = sto ? sto(o) : DIERR_GENERIC;
+            }
+            EnterCriticalSection(&g_cs);
+            g_link[i].started = act[i] == 3 && SUCCEEDED(hr);
+            LeaveCriticalSection(&g_cs);
+        }
+    }
+}
+
 static DWORD WINAPI heartbeat(LPVOID arg)
 {
     unsigned seq = 0;
@@ -830,14 +1083,16 @@ static DWORD WINAPI heartbeat(LPVOID arg)
     for (;;) {
         Fx *s1, *s2, *sp;
         Sleep(50);
+        maintain();
         EnterCriticalSection(&g_cs);
         if (g_cfg.udp_port > 0) {
             s1 = latest_named("Stall1");
             s2 = latest_named("Stall2");
             sp = latest_named("Spring");
-            emit(2, "STATE seq=%u stall1=%ld stall2=%ld spring_k=%ld", seq++,
+            emit(2, "STATE seq=%u stall1=%ld stall2=%ld spring_k=%ld broken=%d setp=%u", seq++,
                  s1 ? (long)s1->gain : -1L, s2 ? (long)s2->gain : -1L,
-                 sp && sp->ts_len >= sizeof(DICONDITION) ? (long)((DICONDITION *)sp->ts)->lPositiveCoefficient : -1L);
+                 sp && sp->ts_len >= sizeof(DICONDITION) ? (long)((DICONDITION *)sp->ts)->lPositiveCoefficient : -1L,
+                 g_brk.active, g_setp_calls);
         }
         LeaveCriticalSection(&g_cs);
     }

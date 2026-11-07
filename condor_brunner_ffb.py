@@ -163,6 +163,12 @@ DEFAULTS = {
     "ground_vib_interval_fast_ms": 30,
     "ground_roughness_gain": 1.0,     # force *= clamp(0.5 + gain*roughness, 0.3, 1.5)
 
+    # --- linkage: the cables still move the rudder's mass, even when stopped ---
+    "limp_load_pct": 20.0,            # how heavy the limp pedals are at rest (% of original profile)
+    "damping_rest": 0.02,             # CLS2Sim friction-by-velocity factor when stopped
+    "damping_per_100kt": 0.06,        # extra damping per 100 kt (air on the rudder)
+    "damping_limit": 15.0,            # cap on the damping force (N or Nm)
+
     # --- airborne slow vibration channel: stall flutter (+ optional turbulence) ---
     "stall_source": "auto",           # auto: Condor's own stall shake via the stick shim, else IAS
     "condor_stall_full_gain": 2500,   # Condor shake level (0-10000) = full pedal flutter
@@ -207,6 +213,7 @@ DEFAULTS = {
     "failure_hold_s": 0.4,
     "failure_min_kt": 60.0,
     "failure_reset_alt_jump_m": 50.0, # altitude teleport = new flight -> reset
+    "failure_residual": 0.4,          # share of the flutter that keeps going after the break
 
     "vib_force_cap": 400,             # hard cap on any vibration force sent
 
@@ -260,6 +267,16 @@ SETTINGS_LAYOUT = [
       ("sf_exponent_high", "Curve shape above the knee. 0 = flat (no more increase),\n"
                            "1 = keeps rising in a straight line. Raise it for more at high speed."),
       ("sf_max", "Hard ceiling on stiffness (%). The curve reaches it at ~133 kt by default.")]),
+    ("Linkage",
+     "The cable linkage still has to move the rudder's mass and fight its friction, so there is\n"
+     "resistance even when stopped - just no centring. Damping resists moving the pedals\n"
+     "quickly: a little at rest (the rudder's mass), more with airspeed (air on the rudder).\n"
+     "Damping uses CLS2Sim's friction-by-velocity: factor x pedal speed (mm/s or deg/s) = force.",
+     [("limp_load_pct", "How heavy the pedals feel when limp (stopped / slow), % of your original\n"
+                        "profile. No centring at rest - they stay where you put them."),
+      ("damping_rest", "Damping factor when stopped. 0 = none. Try steps of 0.01."),
+      ("damping_per_100kt", "Extra damping factor per 100 kt of airspeed."),
+      ("damping_limit", "Most force the damping can add (N, or Nm on rotational pedals).")]),
     ("YawFeel",
      "How the pedals react to sideslip (yaw string).",
      [("float_mode", "resist = the pedal you push pushes back harder the more you yaw.\n"
@@ -334,9 +351,12 @@ SETTINGS_LAYOUT = [
                                "just before the wing goes) on the pedals, at full. 0 = off."),
       ("condor_vne_interval_ms", "VNE flutter period (ms).")]),
     ("StructuralFailure",
-     "When a wing comes off (Condor shows it as a violent, sustained roll at speed), all\n"
-     "buzz and flutter stop instantly - like Condor's stick does - until the next flight.",
+     "When a wing comes off (the stick shim sees Condor cut its VNE flutter, or Condor shows a\n"
+     "violent, sustained roll at speed), the flutter drops suddenly - but the tail and the other\n"
+     "wing are still in the airflow, so some keeps going, fading as you slow down.",
      [("failure_detect", "true / false."),
+      ("failure_residual", "Share of the flutter that keeps going after the break (0-1).\n"
+                           "0 = everything stops dead (what Condor's own stick does)."),
       ("failure_rollrate_dps", "Roll rate (deg/s) that counts as uncontrolled. Normal flying stays\n"
                                "well under 60; a lost wing rolls at 120-150."),
       ("failure_hold_s", "How long the roll rate must stay that high (s)."),
@@ -517,6 +537,7 @@ SET_VIB_FAST_MS = 0xC1
 SET_VIB_FAST_F = 0xC2
 SET_VIB_SLOW_MS = 0xC3
 SET_VIB_SLOW_F = 0xC4
+SET_FRICTION_BY_VELOCITY = 0xE2  # Float[2] (factor, limit); lost on device state change
 
 DATA_POS_NORM = 0x11
 
@@ -627,6 +648,7 @@ class ShimIn:
     def __init__(self, port, host="127.0.0.1"):
         self.sock = None
         self.stall1 = self.stall2 = self.spring_k = -1
+        self.broken = False
         self.last = -1e9
         self.packets = 0
         if port and port > 0:
@@ -660,15 +682,17 @@ class ShimIn:
             self.stall1 = vals.get("stall1", -1)
             self.stall2 = vals.get("stall2", -1)
             self.spring_k = vals.get("spring_k", -1)
+            self.broken = vals.get("broken", 0) == 1
             self.last = time.monotonic()
             self.packets += 1
 
     def shake(self, now=None, max_age=1.0):
-        """(stall1, stall2) while the shim is alive and Condor has its shake effects, else None."""
+        """(stall1, stall2, broken) while the shim is alive and Condor has its shake effects,
+        else None. broken = the shim saw Condor cut its VNE flutter dead (wing gone)."""
         now = time.monotonic() if now is None else now
         if now - self.last > max_age or self.stall1 < 0 or self.stall2 < 0:
             return None
-        return self.stall1, self.stall2
+        return self.stall1, self.stall2, self.broken
 
 
 # ----------------------------------------------------------------------------
@@ -736,8 +760,8 @@ class Cls2Sim:
     def override(self, override_id, axes):
         return self.ok(self.xfer(struct.pack("<III", CMD_OVERRIDE, axes, override_id)))
 
-    def setting(self, axes, sid, fmt, value):
-        return self.ok(self.xfer(struct.pack("<III" + fmt, CMD_SETTING, axes, sid, value)))
+    def setting(self, axes, sid, fmt, *values):
+        return self.ok(self.xfer(struct.pack("<III" + fmt, CMD_SETTING, axes, sid, *values)))
 
     def watchdog(self, ms):
         return self.ok(self.xfer(struct.pack("<IIH", CMD_RC_CONFIG, 0x00, int(ms))))
@@ -977,13 +1001,14 @@ def run_lever_setup(settings_path, joy=None):
 
 
 class Targets:
-    __slots__ =("sf", "trim", "fast_f", "fast_ms", "slow_f", "slow_ms", "move_back")
+    __slots__ = ("sf", "trim", "fast_f", "fast_ms", "slow_f", "slow_ms", "move_back", "damp")
 
-    def __init__(self, sf, trim, fast_f, fast_ms, slow_f, slow_ms, move_back=1):
+    def __init__(self, sf, trim, fast_f, fast_ms, slow_f, slow_ms, move_back=1, damp=0.0):
         self.sf, self.trim = sf, trim
         self.fast_f, self.fast_ms = fast_f, fast_ms
         self.slow_f, self.slow_ms = slow_f, slow_ms
         self.move_back = move_back
+        self.damp = damp
 
 
 class ForceModel:
@@ -997,6 +1022,9 @@ class ForceModel:
         self.warned_no_ext = False
         self.broken = False               # structural failure latched (wing came off)
         self.fast_roll_s = 0.0
+        self.peak_fast = self.peak_slow = 0.0          # recent vibration, for the residual
+        self.peak_fast_ms = self.peak_slow_ms = 50
+        self.res = None                   # (fast_f, fast_ms, slow_f, slow_ms, kt) frozen at the break
         self.prev_time = None
         self.prev_alt = None
 
@@ -1004,6 +1032,16 @@ class ForceModel:
         step = self.c["float_rate_per_s"] * dt
         self.trim += clamp(target - self.trim, -step, step)
         return self.trim
+
+    def _latch_broken(self, kt, why):
+        if self.broken:
+            return
+        self.broken = True
+        r = clamp(self.c["failure_residual"], 0.0, 1.0)
+        self.res = (self.peak_fast * r, self.peak_fast_ms, self.peak_slow * r, self.peak_slow_ms, max(kt, 1.0))
+        print(f"\n[structure] wing failure ({why}) - " +
+              (f"flutter drops to {r * 100:.0f}% and fades as you slow down" if r > 0
+               else "all flutter off") + ", until the next flight")
 
     def _check_structure(self, s, kt, on_ground, dt):
         """Latch a structural failure: sustained huge roll rate at speed (a wing is gone).
@@ -1022,21 +1060,23 @@ class ForceModel:
                 kt > c["failure_min_kt"] and abs(math.degrees(rr)) > c["failure_rollrate_dps"]):
             self.fast_roll_s += dt
             if self.fast_roll_s >= c["failure_hold_s"] and not self.broken:
-                self.broken = True
-                print("\n[structure] wing failure detected - all buzz/flutter off until the next flight")
+                self._latch_broken(kt, "sustained roll at speed")
         else:
             self.fast_roll_s = 0.0
 
     def neutral(self, dt):
         c = self.c
         self.broken = False               # menu / new flight
+        self.res = None
+        self.peak_fast = self.peak_slow = 0.0
         self.ias.reset()
         self.yaw.reset()
         self.info = {"mode": "NEUTRAL"}
         self.limp = True                  # paused / no data: limp, pedals stay put
-        return Targets(20, self._slew(0.0, dt),
+        div = max(0.2, float(c["profile_divider"]))
+        return Targets(int(round(clamp(c["limp_load_pct"] * div, 20, 999))), self._slew(0.0, dt),
                        0, c["ground_vib_interval_slow_ms"], 0, c["turb_vib_interval_ms"],
-                       move_back=0)
+                       move_back=0, damp=max(0.0, c["damping_rest"]))
 
     def update(self, s, dt, airbrake=0.0, shake=None):
         """shake: (stall1, stall2) gains from the stick shim, or None."""
@@ -1058,8 +1098,8 @@ class ForceModel:
                     * (kt / knee) ** c["sf_exponent_high"])
         load = min(load, c["sf_max"])
         sf = int(round(clamp(load * div, 20, 999)))                         # % of CLS2Sim's
-        if self.limp:
-            sf = 20                       # CLS2Sim minimum -> lightest friction while limp
+        if self.limp:                     # no centring; the profile acts as linkage friction
+            sf = int(round(clamp(c["limp_load_pct"] * div, 20, 999)))
         eff_load = sf / div               # what you actually feel, % of original profile
 
         # 2) yaw feel: shift the spring centre with sideslip (yaw string), faded in with IAS.
@@ -1110,7 +1150,7 @@ class ForceModel:
             turb = c["turb_vib_force_per_unit"] * ts if isinstance(ts, float) else 0.0
             buf = 0.0
             if use_condor:
-                s1, s2 = shake
+                s1, s2 = shake[0], shake[1]
                 frac = clamp(s1 / max(1.0, float(c["condor_stall_full_gain"])), 0.0, 1.0)
                 if frac > 0:
                     buf = c["buffet_force_max"] * frac ** max(0.1, c["condor_stall_curve"])
@@ -1151,9 +1191,25 @@ class ForceModel:
                                   (vnef, c["condor_vne_interval_ms"]),
                                   (turb, c["turb_vib_interval_ms"]))
 
+        # remember the recent vibration (decaying peak) so a break can keep a share of it
+        decay = math.exp(-dt / 1.5)
+        if not self.broken:
+            if fast_f >= self.peak_fast * decay:
+                self.peak_fast, self.peak_fast_ms = fast_f, fast_ms
+            else:
+                self.peak_fast *= decay
+            if slow_f >= self.peak_slow * decay:
+                self.peak_slow, self.peak_slow_ms = slow_f, slow_ms
+            else:
+                self.peak_slow *= decay
+        if shake is not None and len(shake) > 2 and shake[2] and not on_ground:
+            self._latch_broken(kt, "Condor cut its VNE flutter dead")
         self._check_structure(s, kt, on_ground, dt)
-        if self.broken:                   # like Condor's stick: flutter stops the instant it breaks
-            fast_f = slow_f = 0.0
+        if self.broken:                   # sudden drop, but the tail and the other wing still flutter
+            rf, rfms, rs, rsms, kb = self.res or (0.0, 50, 0.0, 50, 1.0)
+            fade = clamp(kt / kb, 0.0, 1.0)
+            fast_f, fast_ms = rf * fade, rfms
+            slow_f, slow_ms = rs * fade, rsms
             hs = vnef = 0.0
         cap = c["vib_force_cap"]
         self.info = {"mode": "GROUND" if on_ground else "AIR", "kt": kt, "gs": gs,
@@ -1161,10 +1217,12 @@ class ForceModel:
                      "limp": self.limp, "load": eff_load,
                      "stall": stall_pct, "ab": airbrake, "hs": hs if not on_ground else 0.0,
                      "broken": self.broken, "src": stall_src, "vne": vnef}
+        damp = max(0.0, c["damping_rest"] + c["damping_per_100kt"] * kt / 100.0)
+        self.info["damp"] = damp
         return Targets(sf, trim,
                        int(clamp(fast_f, 0, cap)), int(max(1, fast_ms)),
                        int(clamp(slow_f, 0, cap)), int(max(10, slow_ms)),
-                       move_back=0 if self.limp else 1)
+                       move_back=0 if self.limp else 1, damp=damp)
 
 
 # ----------------------------------------------------------------------------
@@ -1172,7 +1230,7 @@ class ForceModel:
 # ----------------------------------------------------------------------------
 class Output:
     DEADBAND = {"sf": 2, "trim": 0.004, "fast_f": 10, "fast_ms": 3, "slow_f": 10, "slow_ms": 3,
-                "move_back": 1}
+                "move_back": 1, "damp": 0.003}
 
     def __init__(self, cls, cfg):
         self.cls = cls
@@ -1181,6 +1239,7 @@ class Output:
         self.sent = {}
         self.vib_on = None
         self.sends = 0
+        self.damp_fails = 0               # CLS2Sim versions without friction-by-velocity reject it
 
     def take_control(self):
         a = self.axis
@@ -1209,6 +1268,17 @@ class Output:
         self._set("sf", SET_SCALE, "H", int(t.sf), force)
         self._set("trim", SET_TRIM, "f", float(t.trim), force)
         self._set("move_back", SET_MOVE_BACK, "B", int(t.move_back), force)
+        if self.damp_fails < 3 and self._changed("damp", t.damp, force):
+            if self.cls.setting(self.axis, SET_FRICTION_BY_VELOCITY, "ff", float(t.damp),
+                                float(self.c["damping_limit"])):
+                self.sent["damp"] = t.damp
+                self.damp_fails = 0
+            else:
+                self.damp_fails += 1
+                if self.damp_fails == 3:
+                    print("\n[!] CLS2Sim didn't accept damping (friction by velocity) - damping off. "
+                          "A newer CLS2Sim may support it.")
+            self.sends += 1
 
         want_on = 1 if (t.fast_f > 0 or t.slow_f > 0) else 0
         if want_on and (self.vib_on != 1 or force):
@@ -1234,6 +1304,8 @@ class Output:
         self.cls.setting(a, SET_TRIM, "f", 0.0)
         self.cls.setting(a, SET_SCALE, "H", full_scale(self.c))
         self.cls.setting(a, SET_MOVE_BACK, "B", 1)   # back to the profile's normal centring
+        if self.damp_fails < 3:
+            self.cls.setting(a, SET_FRICTION_BY_VELOCITY, "ff", 0.0, 0.0)
         for oid in (OVR_SCALE, OVR_TRIM, OVR_VIB):
             self.cls.override(oid, 0)            # axis 0 = override off
         if self.c["watchdog_ms"]:
@@ -1655,6 +1727,7 @@ def run_bridge(cfg, dry_run=False, watcher=None, max_seconds=0.0):
                             f"({'condor' if i.get('src') == 'condor' else 'onset %3.0fkt' % i['onset']}) | "
                             f"brakes {i.get('ab', 0) * 100:3.0f}% | hi-spd {i.get('hs', 0):3.0f}"
                             f"{' | VNE flutter %3.0f' % i['vne'] if i.get('vne') else ''}"
+                            f" | damp {i.get('damp', 0):.3f}"
                             f"{' | WING GONE' if i.get('broken') else ''}")
                 errs = f" err {cls.total_fail}" if cls and cls.total_fail else ""
                 print(f"\r{line} |{pos_txt}{errs}   ", end="", flush=True)

@@ -27,16 +27,23 @@ static BOOL CALLBACK cb(LPCDIFILEEFFECT fe, LPVOID ref)
     return DIENUM_CONTINUE;
 }
 
-static void write_ini(const char *dir, int spring, int shake, int port)
+static void write_ini(const char *dir, int spring, int shake, int port, const char *extra)
 {
-    char p[MAX_PATH], b[256];
+    char p[MAX_PATH], b[512];
     FILE *f;
     snprintf(p, sizeof p, "%sffb_shim.ini", dir);
     f = fopen(p, "w");
-    snprintf(b, sizeof b, "[Gain]\nspring=%d\nshake=%d\n; a comment\nmaster=100\n[Log]\nenabled=1\n[Bridge]\nudp_port=%d\n",
-             spring, shake, port);
+    snprintf(b, sizeof b, "[Gain]\nspring=%d\nshake=%d\n; a comment\nmaster=100\n[Log]\nenabled=1\n[Bridge]\nudp_port=%d\n%s",
+             spring, shake, port, extra ? extra : "");
     fputs(b, f);
     fclose(f);
+}
+
+static int find_sub(int sub)
+{
+    int i, n = mfx(-1, 0);
+    for (i = n - 1; i >= 0; i--) if (mfx(i, 0) == sub && mfx(i, 4) == 0) return i;
+    return -1;
 }
 
 static HRESULT set_gain(LPDIRECTINPUTEFFECT fx, DWORD gain)
@@ -71,14 +78,14 @@ int main(void)
     WSADATA w;
     SOCKET s;
     struct sockaddr_in a;
-    int udp_lines = 0, states = 0, n, saw_stall_start = 0, i;
+    int udp_lines = 0, states = 0, n, saw_stall_start = 0, i, saw_broken = 0;
     u_long nb = 1;
     DIEFFECT e;
     DIPROPDWORD pd;
 
     GetModuleFileNameA(NULL, dir, MAX_PATH);
     sl = strrchr(dir, '\\'); sl[1] = 0;
-    write_ini(dir, 150, 200, 55299);
+    write_ini(dir, 150, 200, 55299, "[Break]\nresidual=0\n");
 
     WSAStartup(MAKEWORD(2, 2), &w);
     s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -147,13 +154,47 @@ int main(void)
 
     /* --- live reload: shake back to 100%, spring 100% */
     Sleep(1100);
-    write_ini(dir, 100, 100, 55299);
+    write_ini(dir, 100, 100, 55299, "[Break]\nresidual=0\n");
     Sleep(700);
     set_gain(g_fx[1], 1200);
     CHECK(mfx(1, 1) == 1200, "after ini edit shake=100: gain 1200 -> %ld", mfx(1, 1));
     set_spring(g_fx[0], 9000);
     CHECK(mfx(0, 2) == 9000 && mfx(3, 2) == 0, "after ini edit spring=100: main %ld, assist %ld", mfx(0, 2), mfx(3, 2));
     for (n = 0; n < 200; n++) set_spring(g_fx[0], 9000);      /* duplicates must not flood the log */
+
+    /* --- linkage: friction / inertia / damper effects of our own, applied with no Condor call */
+    Sleep(1100);
+    write_ini(dir, 150, 200, 55299, "[Break]\nresidual=40\n[Linkage]\nfriction=10\ninertia=5\ndamper=4\ndamper_airspeed=10\n");
+    Sleep(800);
+    {
+        int fr = find_sub(10), in = find_sub(9), dm = find_sub(8);
+        CHECK(fr >= 0 && in >= 0 && dm >= 0, "linkage effects created by the heartbeat (friction %d inertia %d damper %d)", fr, in, dm);
+        if (fr >= 0 && in >= 0 && dm >= 0) {
+            CHECK(mfx(fr, 2) == 1000 && mfx(in, 2) == 500, "friction %ld, inertia %ld", mfx(fr, 2), mfx(in, 2));
+            CHECK(mfx(dm, 2) == 1300, "damper = 4%% + 10%% x 9000/10000 -> %ld", mfx(dm, 2));
+            CHECK(mfx(fr, 3) >= 1 && mfx(dm, 3) >= 1, "linkage effects started");
+            set_spring(g_fx[0], 3000);
+            Sleep(250);
+            CHECK(mfx(dm, 2) == 700, "damper follows airspeed: k 3000 -> %ld", mfx(dm, 2));
+        }
+    }
+
+    /* --- wing break: Condor cuts VNE flutter dead -> residual that fades with airspeed */
+    set_spring(g_fx[0], 10000);                        /* > 97 kt */
+    set_gain(g_fx[1], 0);
+    set_gain(g_fx[2], 10000);
+    CHECK(mfx(2, 1) == 10000, "VNE flutter at full (%ld)", mfx(2, 1));
+    set_gain(g_fx[2], 0);                              /* the wing goes */
+    CHECK(mfx(2, 1) == 4000, "break: Stall2 drops to 40%% instead of 0 -> %ld", mfx(2, 1));
+    Sleep(300);
+    set_spring(g_fx[0], 5000);                         /* half the airspeed */
+    Sleep(300);
+    CHECK(mfx(2, 1) == 2000, "residual fades with airspeed: %ld", mfx(2, 1));
+    set_gain(g_fx[2], 0);                              /* Condor keeps sending 0: residual stays */
+    CHECK(mfx(2, 1) == 2000, "Condor's zeros don't kill the residual (%ld)", mfx(2, 1));
+    set_spring(g_fx[0], 800);                          /* slowed right down */
+    Sleep(300);
+    CHECK(mfx(2, 1) == 0, "slow -> residual off (%ld)", mfx(2, 1));
 
     /* --- teardown: releasing Condor's spring takes the assist with it */
     Sleep(150);
@@ -168,10 +209,12 @@ int main(void)
         udp_lines++;
         if (strstr(buf, "START fx=1 Stall1")) saw_stall_start = 1;
         if (strstr(buf, " STATE ")) { states++; snprintf(last_state, sizeof last_state, "%s", buf); }
+        if (strstr(buf, " STATE ") && strstr(buf, "broken=1")) saw_broken = 1;
     }
     CHECK(saw_stall_start, "UDP carried 'START fx=1 Stall1'");
     CHECK(states >= 20, "heartbeat STATE lines: %d (last: %s)", states, last_state);
-    CHECK(strstr(last_state, "stall1=1200 stall2=3000") != NULL, "STATE reports Condor's own gains");
+    CHECK(strstr(last_state, "stall1=0 stall2=0 spring_k=") != NULL, "STATE reports Condor's own gains (not the residual)");
+    CHECK(saw_broken, "STATE carried broken=1 during the break");
     printf("%d udp lines, %d failure(s)\n", udp_lines, fails);
     return fails;
 }
