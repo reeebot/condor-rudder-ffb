@@ -181,12 +181,19 @@ DEFAULTS = {
     "airbrake_closed_raw": 0,
     "airbrake_open_raw": 65535,
     "airbrake_deadzone": 0.05,
-    "airbrake_vib_force_max": 150,    # at full airbrakes and airbrake_vib_full_kt
-    "airbrake_vib_full_kt": 130.0,
+    "airbrake_vib_force_max": 240,    # at full airbrakes and airbrake_vib_full_kt
+    "airbrake_vib_full_kt": 110.0,
     "airbrake_vib_min_kt": 15.0,
-    "airbrake_vib_low_frac": 0.1,     # share of full buffet you still feel at low speed
-    "airbrake_vib_curve": 0.45,       # <1 = builds early (70 kt ~ 3/4), keeps growing to full
+    "airbrake_vib_low_frac": 0.3,     # share of full buffet you still feel at low speed
+    "airbrake_vib_curve": 0.4,        # <1 = builds early (60 kt ~ 80%), keeps growing to full
     "airbrake_vib_interval_ms": 60,
+
+    # --- high-speed buffet: buzz building toward VNE ---
+    "hs_buffet_onset_kt": 115.0,      # 0 = off
+    "hs_buffet_full_kt": 145.0,       # ~VNE of a typical 15 m / standard class glider
+    "hs_buffet_force_max": 140,
+    "hs_buffet_curve": 1.5,           # >1 = creeps in, then builds hard near VNE
+    "hs_buffet_interval_ms": 28,
 
     "vib_force_cap": 400,             # hard cap on any vibration force sent
 
@@ -292,9 +299,17 @@ SETTINGS_LAYOUT = [
       ("airbrake_vib_full_kt", "IAS where airbrake buffet reaches full strength (kt)."),
       ("airbrake_vib_min_kt", "No airbrake buffet below this IAS (kt)."),
       ("airbrake_vib_low_frac", "Share of the full buffet you still feel at low speed (0-1)."),
-      ("airbrake_vib_curve", "Build-up shape. Below 1 = most of it early (70 kt ~ 3/4 by\n"
+      ("airbrake_vib_curve", "Build-up shape. Below 1 = most of it early (60 kt ~ 80% by\n"
                              "default), still growing to full at airbrake_vib_full_kt. 1 = linear."),
       ("airbrake_vib_interval_ms", "Buffet period (ms). Lower = faster, buzzier.")]),
+    ("HighSpeedBuffet",
+     "Buzz that creeps in at high speed and builds hard toward VNE. VNE varies by glider\n"
+     "(roughly 135-150 kt); set hs_buffet_full_kt near the VNE of the glider you fly.",
+     [("hs_buffet_onset_kt", "Buffet starts above this IAS (kt). 0 = off."),
+      ("hs_buffet_full_kt", "Full strength at this IAS (kt) - put it near VNE."),
+      ("hs_buffet_force_max", "Strength at full."),
+      ("hs_buffet_curve", "Build-up shape. >1 = creeps in then builds hard near VNE. 1 = linear."),
+      ("hs_buffet_interval_ms", "Buzz period (ms). Lower = faster, finer buzz.")]),
     ("Turbulence",
      "Optional airborne vibration from Condor's turbulence strength. 0 = off.",
      [("turb_vib_force_per_unit", "Vibration force per unit of turbulence."),
@@ -967,6 +982,7 @@ class ForceModel:
         # 4) airborne slow channel: stall flutter and/or turbulence
         slow_f, slow_ms = 0.0, c["turb_vib_interval_ms"]
         stall_pct = 0.0
+        hs = 0.0
         g = s.get("gforce")
         g = clamp(g, 0.3, 4.0) if isinstance(g, float) and g > 0 else 1.0
         onset = c["buffet_onset_kt"] * (math.sqrt(g) if c["buffet_g_scaling"] else 1.0)
@@ -983,6 +999,14 @@ class ForceModel:
                 buzz = c["buffet_buzz_force_max"] * frac ** 3 * fade_out
                 if buzz > 0:
                     fast_f, fast_ms = buzz, c["buffet_buzz_interval_ms"]
+            # high-speed buffet on the fast channel (stall buzz and this never overlap)
+            hs = 0.0
+            if c["hs_buffet_onset_kt"] > 0 and kt > c["hs_buffet_onset_kt"]:
+                span = max(1e-6, c["hs_buffet_full_kt"] - c["hs_buffet_onset_kt"])
+                x = clamp((kt - c["hs_buffet_onset_kt"]) / span, 0.0, 1.0)
+                hs = c["hs_buffet_force_max"] * x ** max(0.1, c["hs_buffet_curve"])
+                if hs > fast_f:
+                    fast_f, fast_ms = hs, c["hs_buffet_interval_ms"]
             # airbrake buffet: a little at low speed, building with speed
             abf = 0.0
             if airbrake > 0 and kt > c["airbrake_vib_min_kt"]:
@@ -1000,7 +1024,7 @@ class ForceModel:
         self.info = {"mode": "GROUND" if on_ground else "AIR", "kt": kt, "gs": gs,
                      "yaw_deg": math.degrees(yaw), "fade": fade, "g": g, "onset": onset,
                      "limp": self.limp, "load": eff_load,
-                     "stall": stall_pct, "ab": airbrake}
+                     "stall": stall_pct, "ab": airbrake, "hs": hs if not on_ground else 0.0}
         return Targets(sf, trim,
                        int(clamp(fast_f, 0, cap)), int(max(1, fast_ms)),
                        int(clamp(slow_f, 0, cap)), int(max(10, slow_ms)),
@@ -1342,6 +1366,16 @@ def run_record(cfg, out_path):
     condor = CondorIn(cfg["condor_listen_host"], cfg["condor_listen_port"], cfg["forward_to"])
     print("RECORDING all Condor UDP data. Close run_ffb.bat first (same port).")
     print("Tip: SendIntervalMs=10 in Condor's UDP.ini records at 100 Hz (catches buffet).")
+    lever = AirbrakeLever(cfg)
+    joy, joy_ids = None, []
+    try:
+        joy = WinJoy()
+        devs = joy.devices()
+        joy_ids = [d["id"] for d in devs]
+        for d in devs:
+            print(f"  also recording controller #{d['id']}: {d['name']} ({d['vidpid']})")
+    except Exception as e:
+        print(f"  (not recording controller axes: {e})")
     print("Waiting for Condor data - start a flight...")
     rows, last_pk, t0 = [], 0, None
     try:
@@ -1353,7 +1387,14 @@ def run_record(cfg, out_path):
                 if t0 is None:
                     t0 = now
                     print("Recording... press Ctrl+C here when done.")
-                rows.append((now - t0, dict(condor.state)))
+                st = dict(condor.state)
+                st["lever_airbrake"] = round(lever.position(), 4)
+                for jid in joy_ids:
+                    r = joy.read(jid)
+                    if r:
+                        for ax, v in r.items():
+                            st[f"joy{jid}_{ax}"] = v
+                rows.append((now - t0, st))
                 if len(rows) % 100 == 0:
                     ias = condor.state.get("airspeed")
                     ias = f"{ias * MS_TO_KT:5.1f} kt" if isinstance(ias, float) else "?"
@@ -1376,7 +1417,7 @@ def run_record(cfg, out_path):
             w.writerow([f"{tr:.3f}"] + [st.get(k, "") for k in keys])
     rate = len(rows) / max(1e-6, rows[-1][0])
     print(f"Saved {len(rows)} samples ({rows[-1][0]:.0f} s, ~{rate:.0f} Hz) to: {out_path}")
-    print("Drag that file into the chat.")
+    print("I can read it straight from this folder - just tell me it's done.")
 
 
 def run_bridge(cfg, dry_run=False, watcher=None, max_seconds=0.0):
@@ -1455,7 +1496,7 @@ def run_bridge(cfg, dry_run=False, watcher=None, max_seconds=0.0):
                             f"yaw {i['yaw_deg']:+5.1f}deg -> trim {t.trim:+.3f} | "
                             f"rumble {t.fast_f:3d} | flutter {t.slow_f:3d} "
                             f"stall {i.get('stall', 0):3.0f}% (onset {i['onset']:3.0f}kt) | "
-                            f"brakes {i.get('ab', 0) * 100:3.0f}%")
+                            f"brakes {i.get('ab', 0) * 100:3.0f}% | hi-spd {i.get('hs', 0):3.0f}")
                 errs = f" err {cls.total_fail}" if cls and cls.total_fail else ""
                 print(f"\r{line} |{pos_txt}{errs}   ", end="", flush=True)
 
