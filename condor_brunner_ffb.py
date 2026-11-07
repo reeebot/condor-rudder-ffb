@@ -195,6 +195,13 @@ DEFAULTS = {
     "hs_buffet_curve": 1.5,           # >1 = creeps in, then builds hard near VNE
     "hs_buffet_interval_ms": 28,
 
+    # --- structural failure: Condor's stick flutter stops dead when a wing breaks ---
+    "failure_detect": True,
+    "failure_rollrate_dps": 90.0,     # sustained roll rate above this at speed = wing gone
+    "failure_hold_s": 0.4,
+    "failure_min_kt": 60.0,
+    "failure_reset_alt_jump_m": 50.0, # altitude teleport = new flight -> reset
+
     "vib_force_cap": 400,             # hard cap on any vibration force sent
 
     # --- filters ---
@@ -310,6 +317,15 @@ SETTINGS_LAYOUT = [
       ("hs_buffet_force_max", "Strength at full."),
       ("hs_buffet_curve", "Build-up shape. >1 = creeps in then builds hard near VNE. 1 = linear."),
       ("hs_buffet_interval_ms", "Buzz period (ms). Lower = faster, finer buzz.")]),
+    ("StructuralFailure",
+     "When a wing comes off (Condor shows it as a violent, sustained roll at speed), all\n"
+     "buzz and flutter stop instantly - like Condor's stick does - until the next flight.",
+     [("failure_detect", "true / false."),
+      ("failure_rollrate_dps", "Roll rate (deg/s) that counts as uncontrolled. Normal flying stays\n"
+                               "well under 60; a lost wing rolls at 120-150."),
+      ("failure_hold_s", "How long the roll rate must stay that high (s)."),
+      ("failure_min_kt", "Only above this IAS (kt), so spins don't count."),
+      ("failure_reset_alt_jump_m", "An altitude jump bigger than this (m) means a new flight.")]),
     ("Turbulence",
      "Optional airborne vibration from Condor's turbulence strength. 0 = off.",
      [("turb_vib_force_per_unit", "Vibration force per unit of turbulence."),
@@ -908,14 +924,41 @@ class ForceModel:
         self.limp = True                  # start limp: stationary until airflow says otherwise
         self.info = {}
         self.warned_no_ext = False
+        self.broken = False               # structural failure latched (wing came off)
+        self.fast_roll_s = 0.0
+        self.prev_time = None
+        self.prev_alt = None
 
     def _slew(self, target, dt):
         step = self.c["float_rate_per_s"] * dt
         self.trim += clamp(target - self.trim, -step, step)
         return self.trim
 
+    def _check_structure(self, s, kt, on_ground, dt):
+        """Latch a structural failure: sustained huge roll rate at speed (a wing is gone).
+        Reset when Condor starts a new flight (sim time jumps back / altitude teleports)."""
+        c = self.c
+        t, alt = s.get("time"), s.get("altitude")
+        if isinstance(t, float) and self.prev_time is not None and t < self.prev_time - 1e-4:
+            self.broken = False
+        if (isinstance(alt, float) and self.prev_alt is not None and
+                abs(alt - self.prev_alt) > c["failure_reset_alt_jump_m"]):
+            self.broken = False
+        self.prev_time = t if isinstance(t, float) else self.prev_time
+        self.prev_alt = alt if isinstance(alt, float) else self.prev_alt
+        rr = s.get("rollrate")
+        if (c["failure_detect"] and not on_ground and isinstance(rr, float) and
+                kt > c["failure_min_kt"] and abs(math.degrees(rr)) > c["failure_rollrate_dps"]):
+            self.fast_roll_s += dt
+            if self.fast_roll_s >= c["failure_hold_s"] and not self.broken:
+                self.broken = True
+                print("\n[structure] wing failure detected - all buzz/flutter off until the next flight")
+        else:
+            self.fast_roll_s = 0.0
+
     def neutral(self, dt):
         c = self.c
+        self.broken = False               # menu / new flight
         self.ias.reset()
         self.yaw.reset()
         self.info = {"mode": "NEUTRAL"}
@@ -1020,11 +1063,16 @@ class ForceModel:
                                   (abf, c["airbrake_vib_interval_ms"]),
                                   (turb, c["turb_vib_interval_ms"]))
 
+        self._check_structure(s, kt, on_ground, dt)
+        if self.broken:                   # like Condor's stick: flutter stops the instant it breaks
+            fast_f = slow_f = 0.0
+            hs = 0.0
         cap = c["vib_force_cap"]
         self.info = {"mode": "GROUND" if on_ground else "AIR", "kt": kt, "gs": gs,
                      "yaw_deg": math.degrees(yaw), "fade": fade, "g": g, "onset": onset,
                      "limp": self.limp, "load": eff_load,
-                     "stall": stall_pct, "ab": airbrake, "hs": hs if not on_ground else 0.0}
+                     "stall": stall_pct, "ab": airbrake, "hs": hs if not on_ground else 0.0,
+                     "broken": self.broken}
         return Targets(sf, trim,
                        int(clamp(fast_f, 0, cap)), int(max(1, fast_ms)),
                        int(clamp(slow_f, 0, cap)), int(max(10, slow_ms)),
@@ -1496,7 +1544,8 @@ def run_bridge(cfg, dry_run=False, watcher=None, max_seconds=0.0):
                             f"yaw {i['yaw_deg']:+5.1f}deg -> trim {t.trim:+.3f} | "
                             f"rumble {t.fast_f:3d} | flutter {t.slow_f:3d} "
                             f"stall {i.get('stall', 0):3.0f}% (onset {i['onset']:3.0f}kt) | "
-                            f"brakes {i.get('ab', 0) * 100:3.0f}% | hi-spd {i.get('hs', 0):3.0f}")
+                            f"brakes {i.get('ab', 0) * 100:3.0f}% | hi-spd {i.get('hs', 0):3.0f}"
+                            f"{' | WING GONE' if i.get('broken') else ''}")
                 errs = f" err {cls.total_fail}" if cls and cls.total_fail else ""
                 print(f"\r{line} |{pos_txt}{errs}   ", end="", flush=True)
 

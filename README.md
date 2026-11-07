@@ -20,6 +20,7 @@ Python 3.8+, standard library only. Windows.
 | **Yaw feel** | The pedal you push pushes back harder the further you yaw (driven by Condor's yaw string). |
 | **Stall flutter** | Condor sends no angle of attack, so it uses the physics equivalent: IAS below stall onset × √g. Builds gradually, plus a faster buzz deep in the stall. Works in turns too. |
 | **Airbrake buffet** | Condor doesn't send airbrake position, so the bridge reads your airbrake lever directly. Already strong by ~60 kt (about 80%), full at 110 kt. |
+| **Structural failure** | When a wing comes off (a violent, sustained roll at speed), every buzz and flutter stops instantly, like Condor's stick does, until the next flight. |
 | **High-speed buffet** | A fine buzz that creeps in above 115 kt and builds hard toward VNE (145 kt by default; set it per glider). |
 | **Ground rumble** | Scales with ground speed and Condor's surface roughness. |
 
