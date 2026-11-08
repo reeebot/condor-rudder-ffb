@@ -27,14 +27,15 @@ static BOOL CALLBACK cb(LPCDIFILEEFFECT fe, LPVOID ref)
     return DIENUM_CONTINUE;
 }
 
+static int g_assist = 1;
 static void write_ini(const char *dir, int spring, int shake, int port, const char *extra)
 {
     char p[MAX_PATH], b[512];
     FILE *f;
     snprintf(p, sizeof p, "%sffb_shim.ini", dir);
     f = fopen(p, "w");
-    snprintf(b, sizeof b, "[Gain]\nspring=%d\nshake=%d\n; a comment\nmaster=100\n[Log]\nenabled=1\n[Bridge]\nudp_port=%d\n%s",
-             spring, shake, port, extra ? extra : "");
+    snprintf(b, sizeof b, "[Gain]\nspring=%d\nspring_assist=%d\nshake=%d\n; a comment\nmaster=100\n[Log]\nenabled=1\n"
+             "[Bridge]\nudp_port=%d\n%s", spring, g_assist, shake, port, extra ? extra : "");
     fputs(b, f);
     fclose(f);
 }
@@ -179,6 +180,22 @@ int main(void)
         }
     }
 
+    /* --- bridge buffet: the pedal bridge commands an extra shake on the stick */
+    {
+        SOCKET c = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        struct sockaddr_in to;
+        const char *cmd = "BUFFET gain=3000 period_ms=70";
+        int bf, k;
+        memset(&to, 0, sizeof to); to.sin_family = AF_INET; to.sin_port = htons(55292); to.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        for (k = 0; k < 6; k++) { sendto(c, cmd, (int)strlen(cmd), 0, (struct sockaddr *)&to, sizeof to); Sleep(50); }
+        Sleep(150);
+        bf = find_sub(4);
+        CHECK(bf > 2 && mfx(bf, 1) == 3000 && mfx(bf, 3) >= 1, "bridge BUFFET -> our triangle on the stick, gain %ld", bf > 2 ? mfx(bf, 1) : -1);
+        Sleep(800);                                    /* bridge goes quiet */
+        CHECK(bf > 2 && mfx(bf, 1) == 0, "bridge silent for 0.5 s -> buffet off (%ld)", bf > 2 ? mfx(bf, 1) : -1);
+        closesocket(c);
+    }
+
     /* --- wing break: Condor cuts VNE flutter dead -> residual that fades with airspeed */
     set_spring(g_fx[0], 10000);                        /* > 97 kt */
     set_gain(g_fx[1], 0);
@@ -195,6 +212,21 @@ int main(void)
     set_spring(g_fx[0], 800);                          /* slowed right down */
     Sleep(300);
     CHECK(mfx(2, 1) == 0, "slow -> residual off (%ld)", mfx(2, 1));
+
+    /* --- default spring boost: tapered curve, no assist, never maxes out early */
+    Sleep(1100);
+    g_assist = 0;
+    write_ini(dir, 150, 200, 55299, "[Break]\nresidual=40\n");
+    Sleep(700);
+    set_spring(g_fx[0], 5000);
+    CHECK(mfx(0, 2) == 6464, "tapered boost: k 5000 x150%% -> %ld", mfx(0, 2));
+    CHECK(mfx(3, 2) == 0, "assist turned off live -> its stiffness zeroed (%ld)", mfx(3, 2));
+    set_spring(g_fx[0], 9000);
+    CHECK(mfx(0, 2) == 9684, "tapered boost: k 9000 -> %ld (no hard clip)", mfx(0, 2));
+    set_spring(g_fx[0], 10000);
+    CHECK(mfx(0, 2) == 10000 && mfx(3, 2) == 0, "top end = stick maximum, no assist (%ld, %ld)", mfx(0, 2), mfx(3, 2));
+    set_spring(g_fx[0], 1000);
+    CHECK(mfx(0, 2) == 1462, "low speed gets nearly the full boost: k 1000 -> %ld", mfx(0, 2));
 
     /* --- teardown: releasing Condor's spring takes the assist with it */
     Sleep(150);

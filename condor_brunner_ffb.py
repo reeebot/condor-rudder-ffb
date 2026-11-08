@@ -117,6 +117,7 @@ DEFAULTS = {
     "cls2sim_timeout_s": 0.25,
     "axis_mask": 0x4,                 # Rudder (pilot). 0x4 also covers a copilot rudder.
     "shim_udp_port": 55291,           # stick shim (dinput8.dll in Condor's folder) feed. 0 = off
+    "shim_cmd_port": 55292,           # where the bridge sends stick buffet commands to the shim
 
     # --- loop ---
     "tick_hz": 30,
@@ -206,6 +207,11 @@ DEFAULTS = {
     "hs_buffet_interval_ms": 28,
     "condor_vne_force_max": 260,      # Condor's own VNE flutter (stick shim), on the pedals. 0 = off
     "condor_vne_interval_ms": 50,
+
+    # --- stick buffet through the stick shim (Condor doesn't shake the stick for these) ---
+    "stick_airbrake_buffet": 30,      # % of the stick's max force at full brakes, full speed
+    "stick_hs_buffet": 25,            # % at the high-speed buffet's full speed
+    "stick_buffet_period_ms": 70,
 
     # --- structural failure: Condor's stick flutter stops dead when a wing breaks ---
     "failure_detect": True,
@@ -350,6 +356,13 @@ SETTINGS_LAYOUT = [
       ("condor_vne_force_max", "With the stick shim: Condor's own VNE flutter (it shakes the stick\n"
                                "just before the wing goes) on the pedals, at full. 0 = off."),
       ("condor_vne_interval_ms", "VNE flutter period (ms).")]),
+    ("StickBuffet",
+     "With the stick shim installed, the bridge also shakes the STICK for things Condor\n"
+     "doesn't: airbrake buffet (same speed curve as the pedals' airbrake buffet) and the\n"
+     "high-speed buffet. % of the stick's maximum force. 0 = off.",
+     [("stick_airbrake_buffet", "Stick buffet at full airbrakes and airbrake_vib_full_kt."),
+      ("stick_hs_buffet", "Stick buffet at hs_buffet_full_kt."),
+      ("stick_buffet_period_ms", "Shake period (ms). Lower = faster, finer.")]),
     ("StructuralFailure",
      "When a wing comes off (the stick shim sees Condor cut its VNE flutter, or Condor shows a\n"
      "violent, sustained roll at speed), the flutter drops suddenly - but the tail and the other\n"
@@ -386,7 +399,9 @@ SETTINGS_LAYOUT = [
       ("cls2sim_timeout_s", "Reply timeout for CLS2Sim requests (s)."),
       ("axis_mask", "Which Brunner axis to drive. 0x4 = rudder."),
       ("shim_udp_port", "UDP port the stick shim sends Condor's shake on (udp_port in\n"
-                        "ffb_shim.ini). 0 = ignore the shim.")]),
+                        "ffb_shim.ini). 0 = ignore the shim."),
+      ("shim_cmd_port", "UDP port the stick shim takes buffet commands on (cmd_port in\n"
+                        "ffb_shim.ini). 0 = don't send.")]),
 ]
 
 RESTART_KEYS = {k for sec, _, keys in SETTINGS_LAYOUT if sec == "Network" for k, _ in keys}
@@ -1138,6 +1153,7 @@ class ForceModel:
         slow_f, slow_ms = 0.0, c["turb_vib_interval_ms"]
         stall_pct = 0.0
         hs = 0.0
+        stick_buf = 0.0
         g = s.get("gforce")
         g = clamp(g, 0.3, 4.0) if isinstance(g, float) and g > 0 else 1.0
         onset = c["buffet_onset_kt"] * (math.sqrt(g) if c["buffet_g_scaling"] else 1.0)
@@ -1190,6 +1206,11 @@ class ForceModel:
                                   (abf, c["airbrake_vib_interval_ms"]),
                                   (vnef, c["condor_vne_interval_ms"]),
                                   (turb, c["turb_vib_interval_ms"]))
+            # the stick feels it too (sent to the stick shim)
+            ab_frac = abf / max(1.0, float(c["airbrake_vib_force_max"]))
+            hs_frac = hs / max(1.0, float(c["hs_buffet_force_max"]))
+            stick_buf = clamp(max(c["stick_airbrake_buffet"] / 100.0 * ab_frac,
+                                  c["stick_hs_buffet"] / 100.0 * hs_frac), 0.0, 1.0)
 
         # remember the recent vibration (decaying peak) so a break can keep a share of it
         decay = math.exp(-dt / 1.5)
@@ -1210,13 +1231,13 @@ class ForceModel:
             fade = clamp(kt / kb, 0.0, 1.0)
             fast_f, fast_ms = rf * fade, rfms
             slow_f, slow_ms = rs * fade, rsms
-            hs = vnef = 0.0
+            hs = vnef = stick_buf = 0.0
         cap = c["vib_force_cap"]
         self.info = {"mode": "GROUND" if on_ground else "AIR", "kt": kt, "gs": gs,
                      "yaw_deg": math.degrees(yaw), "fade": fade, "g": g, "onset": onset,
                      "limp": self.limp, "load": eff_load,
                      "stall": stall_pct, "ab": airbrake, "hs": hs if not on_ground else 0.0,
-                     "broken": self.broken, "src": stall_src, "vne": vnef}
+                     "broken": self.broken, "src": stall_src, "vne": vnef, "stick_buffet": stick_buf}
         damp = max(0.0, c["damping_rest"] + c["damping_per_100kt"] * kt / 100.0)
         self.info["damp"] = damp
         return Targets(sf, trim,
@@ -1644,6 +1665,7 @@ def run_bridge(cfg, dry_run=False, watcher=None, max_seconds=0.0):
     condor = CondorIn(cfg["condor_listen_host"], cfg["condor_listen_port"], cfg["forward_to"])
     shim = ShimIn(cfg["shim_udp_port"])
     shim_live = False
+    shim_tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     model = ForceModel(cfg)
     lever = AirbrakeLever(cfg)
     cls = out = None
@@ -1689,6 +1711,13 @@ def run_bridge(cfg, dry_run=False, watcher=None, max_seconds=0.0):
             live = condor.packets and (now - condor.last_change) < cfg["stale_after_s"]
             ab = lever.position()
             t = model.update(condor.state, period, ab, shake) if live else model.neutral(period)
+            if shim_live and cfg["shim_cmd_port"] > 0:
+                gain = int(round(10000 * model.info.get("stick_buffet", 0.0)))
+                try:
+                    shim_tx.sendto(f"BUFFET gain={gain} period_ms={int(cfg['stick_buffet_period_ms'])}"
+                                   .encode("ascii"), ("127.0.0.1", int(cfg["shim_cmd_port"])))
+                except OSError:
+                    pass
 
             if out:
                 if connected:

@@ -86,5 +86,51 @@ t, i = run(None, kt=100.0)
 check(abs(t.damp - (cfg["damping_rest"] + cfg["damping_per_100kt"])) < 0.002, f"100 kt: damping {t.damp:.3f}")
 t, i = run(None, kt=0.0, limp_load_pct=35.0)
 check(t.sf == 35, f"limp_load_pct 35 -> scale {t.sf}")
+
+# --- stick buffet (sent to the shim): airbrakes and high speed
+def run_ab(kt, ab, n=40, **kw):
+    mod = m.ForceModel(dict(cfg, **kw))
+    st = dict(air, airspeed=kt * 0.514444)
+    for i in range(n):
+        st["time"] = 1.0 + i * 0.033
+        mod.update(st, 1 / 30, ab, (0, 0, False))
+    return mod.info.get("stick_buffet", 0.0)
+v = run_ab(cfg["airbrake_vib_full_kt"], 1.0)
+check(abs(v - cfg["stick_airbrake_buffet"] / 100) < 0.01, f"full brakes at full speed -> stick buffet {v:.2f}")
+v = run_ab(60, 1.0)
+check(0.1 < v < cfg["stick_airbrake_buffet"] / 100, f"full brakes at 60 kt -> {v:.2f} (already strong)")
+v = run_ab(60, 0.0)
+check(v == 0, f"brakes closed at 60 kt -> {v}")
+v = run_ab(cfg["hs_buffet_full_kt"], 0.0)
+check(abs(v - cfg["stick_hs_buffet"] / 100) < 0.01, f"high-speed buffet full -> stick {v:.2f}")
+v = run_ab(cfg["airbrake_vib_full_kt"], 1.0, stick_airbrake_buffet=0)
+check(v == 0, "stick_airbrake_buffet = 0 -> off")
+
+# --- end to end: bridge (dry run) sends BUFFET to the shim's command port while the shim is live
+import threading
+CPORT, SPORT, KPORT = 55395, 55396, 55397
+bcfg = dict(cfg, condor_listen_port=CPORT, shim_udp_port=SPORT, shim_cmd_port=KPORT, forward_to="")
+rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); rx.bind(("127.0.0.1", KPORT)); rx.settimeout(0.2)
+th = threading.Thread(target=m.run_bridge, args=(bcfg, True, None, 2.5), daemon=True)
+th.start()
+t0 = time.monotonic(); simtime = 12.0; got = []
+while time.monotonic() - t0 < 2.4:
+    simtime += 0.02 / 3600
+    msg = (f"time={simtime}\r\nairspeed={140 * 0.514444}\r\naltitude=900\r\nyawstringangle=0\r\n"
+           f"vx=70\r\nvy=0\r\nvz=0\r\nheight=400\r\nwheelheight=400\r\ngforce=1.0\r\n")
+    tx.sendto(msg.encode(), ("127.0.0.1", CPORT))
+    tx.sendto(b"0 STATE seq=1 stall1=0 stall2=0 spring_k=10000 broken=0", ("127.0.0.1", SPORT))
+    try:
+        while True:
+            d, _ = rx.recvfrom(256); got.append(d.decode())
+    except socket.timeout:
+        pass
+    except BlockingIOError:
+        pass
+    time.sleep(0.02)
+th.join(3)
+gains = [int(g.split("gain=")[1].split()[0]) for g in got if g.startswith("BUFFET gain=")]
+check(len(gains) > 10 and max(gains) > 1000 and gains[-1] == 0,
+      f"bridge -> shim: {len(gains)} BUFFET commands, peak gain {max(gains or [0])} at 140 kt, 0 once Condor stops")
 print("ALL PASS" if not fails else f"{fails} FAILED")
 sys.exit(1 if fails else 0)

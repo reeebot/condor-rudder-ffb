@@ -47,8 +47,12 @@ What Condor actually sends (measured with the shim's log):
 
 So the shim scales:
 
-- `spring`: the stiffness. Past the 100% cap an **assist spring** on the same axes carries the
-  rest, so the boost still works at high speed (`spring_assist=0` turns that off).
+- `spring`: the stiffness, on a tapered curve: the full boost at low speed, less toward the top,
+  and the stick's maximum at Condor's top stiffness (~97 kt), so the force keeps building to the
+  end of the travel. (`spring_assist=1` multiplies straight and adds a second spring past the
+  cap instead: stronger at speed, but the force then maxes out part way through the travel,
+  especially with trim in - soft, then the hard end stop.) Condor puts the pitch trim into the
+  spring's offset.
 - `shake`: the shake effects' gain, spilling into the magnitude once the gain is at 100%
   (`shake_curve` below 1 brings the first light buffet through stronger).
 
@@ -59,6 +63,9 @@ And adds two things Condor doesn't do:
   parked. The damping grows with airspeed (read from Condor's spring stiffness).
 - **Wing break** (`[Break]`): when Condor cuts its VNE flutter dead (the wing just broke), the shim
   keeps 40% of it going, fading with airspeed, instead of going silent.
+- **Bridge buffet**: the pedal bridge (which reads the airbrake lever and Condor's airspeed) sends
+  `BUFFET gain= period_ms=` to UDP 55292 and the shim plays it as an extra shake on the stick:
+  airbrake buffet and high-speed buffet (`[StickBuffet]` in `settings.ini`).
 
 - **No input lag**: stick axes and buttons never go through it, only force commands do.
 - **Log**: `ffb_shim.log` in the Condor folder lists every effect Condor creates, changes, starts
@@ -157,8 +164,6 @@ and pause) and a fake CLS2Sim (`tests/mock_cls2sim.py`, validates every packet).
 
 ## Roadmap
 
-- **Extra stick effects through the shim** (airbrake buffet, high-speed buffet) as additional
-  DirectInput effects on the stick Condor already drives.
 - **Stick via CLS2Sim** with the same effects (stall flutter, airbrake and high-speed buffet), each
   with its own onset and strength per axis - the stick can feel the stall sooner or harder than the
   pedals.

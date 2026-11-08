@@ -6,14 +6,17 @@
  * straight through. Only the force-feedback calls are touched:
  *
  *   - effect strengths are multiplied by the percentages in ffb_shim.ini (live reload):
- *       spring: stiffness; past the 100% DirectInput cap a second "assist" spring on the same
- *               axes carries the rest, so the boost keeps working at high speed
+ *       spring: stiffness, on a curve that boosts the low end and tapers into the stick's
+ *               maximum at Condor's own top stiffness (~97 kt), so the force never maxes out
+ *               part way through the travel (optional "assist" spring for more than that)
  *       shake:  Condor drives its stall/VNE shake with the effect gain, so that is what we
  *               scale (spilling into the magnitude once the gain is maxed)
  *   - linkage: friction, inertia and damping effects of our own on the stick, so moving it
  *     always means moving cables and a control surface with mass (more damping with speed)
  *   - wing break: Condor cuts its VNE flutter dead; we keep a share of it going (the other
  *     wing and the tail still flutter), fading as the airspeed drops
+ *   - bridge buffet: the pedal bridge (which reads the airbrake lever and Condor's flight data)
+ *     sends "BUFFET gain=.. period_ms=.." to UDP 55292; we play it as an extra shake on the stick
  *   - every effect Condor creates, changes, starts or stops is written to ffb_shim.log and
  *     sent as one text line over UDP to 127.0.0.1 (so the pedal bridge can follow Condor's
  *     own stall/VNE shake)
@@ -34,7 +37,7 @@
 #include <stdlib.h>
 #include <math.h>
 
-#define SHIM_VERSION "0.3"
+#define SHIM_VERSION "0.4"
 
 /* ------------------------------------------------------------------ vtable slots */
 enum { DI8_CreateDevice = 3 };
@@ -59,8 +62,9 @@ typedef struct {
     double shake_curve;
     int break_residual;
     int link_friction, link_inertia, link_damper, link_damper_speed;
+    int cmd_port, bridge_buffet;
 } Cfg;
-static Cfg g_cfg = {100, 100, 100, 100, 100, 1, 1, 1, 50, 55291, 1.0, 0, 0, 0, 0, 0};
+static Cfg g_cfg = {100, 100, 100, 100, 100, 0, 1, 1, 50, 55291, 1.0, 0, 0, 0, 0, 0, 55292, 100};
 static unsigned g_setp_calls;
 static FILETIME g_ini_mtime;
 static DWORD g_ini_check;
@@ -156,6 +160,7 @@ typedef struct {
     BYTE assist_ts[TS_MAX];
     DWORD assist_ts_len, assist_gain;
     int assist_fail;
+    DWORD cgain;              /* last gain Condor itself set with SetParameters (not the creation default) */
 } Fx;
 static Fx g_fx[128];
 static int g_nfx, g_next_id;
@@ -187,6 +192,10 @@ static struct { int active; void *obj; DWORD level; LONG k_break; DWORD t0; DWOR
 /* linkage effects of our own: 0 friction, 1 inertia, 2 damper */
 static struct { void *obj; void *dev; LONG sent; int fails; int started; } g_link[3];
 static int g_link_restart, g_link_drop;
+/* extra shake commanded by the pedal bridge (airbrake / high-speed buffet) */
+static struct { void *obj; void *dev; DWORD want, period_ms, sent, sent_period; DWORD rx_tick; int fails, started; } g_buf;
+static SOCKET g_cmd = INVALID_SOCKET;
+static int g_cmd_port_bound, g_buf_drop;
 
 /* effects found in Effects.ffe, so the log can show Condor's own names */
 typedef struct { int sub; DWORD period; char name[64]; } FileFx;
@@ -303,7 +312,7 @@ static void read_cfg(int announce)
     c.shake = clampi(GetPrivateProfileIntA("Gain", "shake", 100, ini), 0, 1000);
     c.constant = clampi(GetPrivateProfileIntA("Gain", "constant", 100, ini), 0, 1000);
     c.master = clampi(GetPrivateProfileIntA("Gain", "master", 100, ini), 0, 1000);
-    c.spring_assist = GetPrivateProfileIntA("Gain", "spring_assist", 1, ini) != 0;
+    c.spring_assist = GetPrivateProfileIntA("Gain", "spring_assist", 0, ini) != 0;
     c.log = GetPrivateProfileIntA("Log", "enabled", 1, ini) != 0;
     c.log_setp = GetPrivateProfileIntA("Log", "log_changes", 1, ini) != 0;
     c.max_mb = clampi(GetPrivateProfileIntA("Log", "max_mb", 50, ini), 1, 2000);
@@ -319,13 +328,15 @@ static void read_cfg(int announce)
     c.link_inertia = clampi(GetPrivateProfileIntA("Linkage", "inertia", 0, ini), 0, 100);
     c.link_damper = clampi(GetPrivateProfileIntA("Linkage", "damper", 0, ini), 0, 100);
     c.link_damper_speed = clampi(GetPrivateProfileIntA("Linkage", "damper_airspeed", 0, ini), 0, 100);
+    c.cmd_port = clampi(GetPrivateProfileIntA("Bridge", "cmd_port", 55292, ini), 0, 65535);
+    c.bridge_buffet = clampi(GetPrivateProfileIntA("Gain", "bridge_buffet", 100, ini), 0, 1000);
     g_cfg = c;
     if (announce)
         emit(0, "CONFIG spring=%d spring_assist=%d shake=%d shake_curve=%.2f damper=%d constant=%d master=%d "
              "break_residual=%d linkage: friction=%d inertia=%d damper=%d damper_airspeed=%d log=%d log_changes=%d "
-             "udp_port=%d", c.spring, c.spring_assist, c.shake, c.shake_curve, c.damper, c.constant, c.master,
-             c.break_residual, c.link_friction, c.link_inertia, c.link_damper, c.link_damper_speed, c.log,
-             c.log_setp, c.udp_port);
+             "udp_port=%d cmd_port=%d bridge_buffet=%d", c.spring, c.spring_assist, c.shake, c.shake_curve, c.damper,
+             c.constant, c.master, c.break_residual, c.link_friction, c.link_inertia, c.link_damper,
+             c.link_damper_speed, c.log, c.log_setp, c.udp_port, c.cmd_port, c.bridge_buffet);
 }
 
 static void maybe_reload(void)
@@ -424,6 +435,18 @@ static LONG scl(LONG v, int pct, LONG lim, int *clip)
 
 typedef struct { DIEFFECT e; BYTE ts[TS_MAX]; DIENVELOPE env; DWORD flags; } Scaled;
 
+/* Spring boost that tapers: k' = 10000 * (1 - (1 - k/10000)^(pct/100)). Slope at zero is
+ * pct/100 (150% = half as stiff again at low speed), and Condor's top stiffness (10000, ~97 kt)
+ * still maps to 10000 - so the boosted spring never asks for more than the stick's maximum
+ * before the end of the travel. */
+static LONG soft_boost(LONG k, int pct)
+{
+    double x = (k < 0 ? -k : k) / 10000.0, y;
+    if (x > 1.0) x = 1.0;
+    y = 1.0 - pow(1.0 - x, pct / 100.0);
+    return (LONG)((k < 0 ? -y : y) * 10000.0 + (k < 0 ? -0.5 : 0.5));
+}
+
 static int copy_effect(LPCDIEFFECT in, Scaled *out, DWORD flags)
 {
     DWORD sz;
@@ -450,6 +473,11 @@ static int make_scaled(int sub, LPCDIEFFECT in, DWORD flags, Scaled *out, int *c
         if (IS_CONDITION(sub)) {
             DICONDITION *c = (DICONDITION *)out->ts;
             for (i = 0; i < in->cbTypeSpecificParams / sizeof(DICONDITION); i++) {
+                if (sub == 7 && pct > 100 && !g_cfg.spring_assist) {
+                    c[i].lPositiveCoefficient = soft_boost(c[i].lPositiveCoefficient, pct);
+                    c[i].lNegativeCoefficient = soft_boost(c[i].lNegativeCoefficient, pct);
+                    continue;      /* saturation stays as Condor set it */
+                }
                 c[i].lPositiveCoefficient = scl(c[i].lPositiveCoefficient, pct, 10000, clip);
                 c[i].lNegativeCoefficient = scl(c[i].lNegativeCoefficient, pct, 10000, clip);
                 if (pct > 100) {   /* let the stronger spring actually reach its new force */
@@ -534,7 +562,8 @@ static DWORD assist_params(Fx *f, BYTE *out)
     int any = 0;
     const DICONDITION *c = (const DICONDITION *)f->ts;
     DICONDITION *a = (DICONDITION *)out;
-    if (f->sub != 7 || !g_cfg.spring_assist || f->ts_len < sizeof(DICONDITION)) return 0;
+    if (f->sub != 7 || f->ts_len < sizeof(DICONDITION)) return 0;
+    if (!g_cfg.spring_assist && !f->assist) return 0;
     n = f->ts_len / sizeof(DICONDITION);
     for (i = 0; i < n; i++) {
         long long kp = (long long)c[i].lPositiveCoefficient * g_cfg.spring / 100;
@@ -549,7 +578,7 @@ static DWORD assist_params(Fx *f, BYTE *out)
                                             : c[i].dwPositiveSaturation * (long long)g_cfg.spring / 100);
         a[i].dwNegativeSaturation = (DWORD)(c[i].dwNegativeSaturation * (long long)g_cfg.spring / 100 > 10000 ? 10000
                                             : c[i].dwNegativeSaturation * (long long)g_cfg.spring / 100);
-        if (a[i].dwPositiveSaturation == 0 && a[i].dwNegativeSaturation == 0) {
+        if ((a[i].dwPositiveSaturation == 0 && a[i].dwNegativeSaturation == 0) || !g_cfg.spring_assist) {
             a[i].lPositiveCoefficient = a[i].lNegativeCoefficient = 0;
         }
         if (a[i].lPositiveCoefficient || a[i].lNegativeCoefficient) any = 1;
@@ -714,7 +743,7 @@ static HRESULT WINAPI Hook_SetParameters(void *self, LPCDIEFFECT peff, DWORD fla
             if (g_brk.active && peff->dwGain > 0) {
                 brk_clear("Condor is shaking the stick again", 0);
             } else if (!g_brk.active && g_cfg.break_residual > 0 && !strcmp(f->name, "Stall2") &&
-                       f->gain >= 3000 && peff->dwGain == 0 && s1g < 50) {
+                       f->cgain >= 3000 && peff->dwGain == 0 && s1g < 50) {
                 g_brk.active = 1;
                 g_brk.obj = self;
                 g_brk.level = f->dev_gain;
@@ -723,8 +752,9 @@ static HRESULT WINAPI Hook_SetParameters(void *self, LPCDIEFFECT peff, DWORD fla
                 g_brk.sent = 0;
                 g_brk.zero = NULL;
                 emit(0, "BREAK Condor cut its VNE flutter dead (gain %lu -> 0): keeping %d%% of it, fading with "
-                     "airspeed (spring k %ld)", (unsigned long)f->gain, g_cfg.break_residual, (long)g_brk.k_break);
+                     "airspeed (spring k %ld)", (unsigned long)f->cgain, g_cfg.break_residual, (long)g_brk.k_break);
             }
+            f->cgain = peff->dwGain;
             if (g_brk.active && self == g_brk.obj && peff->dwGain == 0 && copy_effect(peff, &s, flags)) {
                 g2 = residual_gain();
                 m2 = f->dev_mag;
@@ -820,7 +850,10 @@ static HRESULT WINAPI Hook_Start(void *self, DWORD iter, DWORD flags)
     if (f && SUCCEEDED(hr)) {
         f->running = 1;
         assist = f->assist;
-        if (f->sub == 7) g_link_restart = 1;
+        if (f->sub == 7) {
+            g_link_restart = 1;
+            g_buf.started = 0;
+        }
     }
     emit(0, "START fx=%d %s %s iter=%lu flags=0x%lx hr=0x%08lx", f ? f->id : -1, f ? f->name : "?",
          sub_name(f ? f->sub : -1), (unsigned long)iter, (unsigned long)flags, (unsigned long)hr);
@@ -894,6 +927,7 @@ static void drop_assists(void *dev)
         }
     if (nd) rel = (PFN_Release)orig_of(dead[0], FX_Release);
     g_link_drop = 1;                  /* the heartbeat thread lets go of the linkage effects */
+    g_buf_drop = 1;
     LeaveCriticalSection(&g_cs);
     for (i = 0; i < nd; i++) if (rel) rel(dead[i]);
 }
@@ -921,6 +955,155 @@ static void set_gain_now(void *fx, DWORD gain)
     e.dwSize = sizeof e;
     e.dwGain = gain;
     if (sp) sp(fx, &e, DIEP_GAIN);
+}
+
+/* Bridge commands: "BUFFET gain=<0-10000> period_ms=<n>", about 20 per second. */
+static void poll_commands(void)
+{
+    char b[256];
+    int n;
+    if (g_cfg.cmd_port <= 0) return;
+    if (g_cmd == INVALID_SOCKET || g_cmd_port_bound != g_cfg.cmd_port) {
+        struct sockaddr_in a;
+        WSADATA w;
+        u_long nb = 1;
+        if (g_cmd != INVALID_SOCKET) closesocket(g_cmd);
+        g_cmd = INVALID_SOCKET;
+        g_cmd_port_bound = g_cfg.cmd_port;
+        WSAStartup(MAKEWORD(2, 2), &w);
+        g_cmd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (g_cmd == INVALID_SOCKET) return;
+        memset(&a, 0, sizeof a);
+        a.sin_family = AF_INET;
+        a.sin_port = htons((u_short)g_cfg.cmd_port);
+        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        if (bind(g_cmd, (struct sockaddr *)&a, sizeof a) != 0) {
+            EnterCriticalSection(&g_cs);
+            emit(0, "BRIDGE can't listen on UDP %d - no bridge buffet on the stick", g_cfg.cmd_port);
+            LeaveCriticalSection(&g_cs);
+            closesocket(g_cmd);
+            g_cmd = INVALID_SOCKET;
+            return;
+        }
+        ioctlsocket(g_cmd, FIONBIO, &nb);
+    }
+    while ((n = recv(g_cmd, b, sizeof b - 1, 0)) > 0) {
+        char *p;
+        b[n] = 0;
+        if (strncmp(b, "BUFFET", 6)) continue;
+        EnterCriticalSection(&g_cs);
+        g_buf.want = 0;
+        if ((p = strstr(b, "gain="))) g_buf.want = (DWORD)clampi(atoi(p + 5), 0, 10000);
+        if ((p = strstr(b, "period_ms="))) g_buf.period_ms = (DWORD)clampi(atoi(p + 10), 10, 1000);
+        if (!g_buf.period_ms) g_buf.period_ms = 70;
+        g_buf.rx_tick = GetTickCount();
+        LeaveCriticalSection(&g_cs);
+    }
+}
+
+static const GUID GUID_Triangle_ = {0x13541C24, 0x8E33, 0x11D0, {0x9A, 0xD0, 0x00, 0xA0, 0xC9, 0xA0, 0x6E, 0x35}};
+
+/* Plays the bridge's buffet as a triangle wave of our own on the stick (pitch, like Condor's
+ * Stall1). Goes quiet if the bridge stops sending for half a second. */
+static void bridge_buffet(void)
+{
+    Fx *ref, *sp;
+    void *dev = NULL, *drop = NULL, *obj;
+    DWORD want, period, a;
+    int act = 0, running = 0;          /* 1 create, 2 update */
+    DIEFFECT e;
+    DWORD axes[4];
+    LONG dirs[4];
+    DIPERIODIC per;
+    HRESULT hr;
+
+    poll_commands();
+    EnterCriticalSection(&g_cs);
+    want = (GetTickCount() - g_buf.rx_tick < 500) ? g_buf.want : 0;
+    want = (DWORD)((long long)want * g_cfg.bridge_buffet / 100);
+    if (want > 10000) want = 10000;
+    period = g_buf.period_ms ? g_buf.period_ms : 70;
+    sp = latest_named("Spring");
+    ref = latest_named("Stall1");
+    if (!ref) ref = sp;
+    if (sp) running = sp->running;
+    if (ref && ref->dev && ref->base.cAxes > 0) {
+        dev = ref->dev;
+        e = ref->base;
+        memcpy(axes, ref->axes, sizeof axes);
+        memcpy(dirs, ref->dirs, sizeof dirs);
+        if (ref == sp) for (a = 0; a < 4; a++) dirs[a] = 0;
+    }
+    if (g_buf.obj && (g_buf.dev != dev || g_buf_drop)) {
+        drop = g_buf.obj;
+        g_buf.obj = NULL;
+        g_buf.sent = 0;
+        g_buf.started = 0;
+    }
+    g_buf_drop = 0;
+    if (dev) {
+        if (!g_buf.obj && want > 0 && running && g_buf.fails < 3) act = 1;
+        else if (g_buf.obj && ((want > g_buf.sent ? want - g_buf.sent : g_buf.sent - want) >= 50 ||
+                               (want == 0 && g_buf.sent) || period != g_buf.sent_period))
+            act = 2;
+    }
+    obj = g_buf.obj;
+    LeaveCriticalSection(&g_cs);
+
+    if (drop) {
+        PFN_Release rel = (PFN_Release)orig_of(drop, FX_Release);
+        if (rel) rel(drop);
+    }
+    if (!act) return;
+    memset(&per, 0, sizeof per);
+    per.dwMagnitude = 10000;
+    per.dwPeriod = period * 1000;
+    e.dwSize = sizeof(DIEFFECT);
+    e.rgdwAxes = axes;
+    e.rglDirection = dirs;
+    e.lpEnvelope = NULL;
+    e.dwGain = want;
+    e.dwDuration = INFINITE;
+    e.dwTriggerButton = DIEB_NOTRIGGER;
+    e.cbTypeSpecificParams = sizeof per;
+    e.lpvTypeSpecificParams = &per;
+    if (act == 1) {
+        PFN_CreateEffect ce = (PFN_CreateEffect)orig_of(dev, DEV_CreateEffect);
+        LPDIRECTINPUTEFFECT o = NULL;
+        HRESULT h2 = DIERR_GENERIC;
+        hr = ce ? ce(dev, &GUID_Triangle_, &e, &o, NULL) : DIERR_GENERIC;
+        if (SUCCEEDED(hr) && o) {
+            PFN_Start st = (PFN_Start)orig_of(o, FX_Start);
+            h2 = st ? st(o, 1, 0) : DIERR_GENERIC;
+        }
+        EnterCriticalSection(&g_cs);
+        if (SUCCEEDED(hr) && o) {
+            g_buf.obj = o;
+            g_buf.dev = dev;
+            g_buf.sent = want;
+            g_buf.sent_period = period;
+            g_buf.started = SUCCEEDED(h2);
+            emit(0, "BUFFET effect created (gain %lu, %lu ms, start hr=0x%08lx)", (unsigned long)want,
+                 (unsigned long)period, (unsigned long)h2);
+        } else {
+            g_buf.fails++;
+            emit(0, "BUFFET create FAILED hr=0x%08lx (try %d of 3)", (unsigned long)hr, g_buf.fails);
+        }
+        LeaveCriticalSection(&g_cs);
+    } else {
+        PFN_SetParameters spf = (PFN_SetParameters)orig_of(obj, FX_SetParameters);
+        hr = spf ? spf(obj, &e, DIEP_GAIN | DIEP_TYPESPECIFICPARAMS) : DIERR_GENERIC;
+        EnterCriticalSection(&g_cs);
+        if (SUCCEEDED(hr)) {
+            g_buf.sent = want;
+            g_buf.sent_period = period;
+        }
+        LeaveCriticalSection(&g_cs);
+        if (SUCCEEDED(hr) && !g_buf.started && running) {
+            PFN_Start st = (PFN_Start)orig_of(obj, FX_Start);
+            if (st && SUCCEEDED(st(obj, 1, 0))) g_buf.started = 1;
+        }
+    }
 }
 
 /* Runs on the heartbeat thread every 50 ms: wing-break residual and the linkage effects.
@@ -988,7 +1171,7 @@ static void maintain(void)
             }
             if (!g_link[i].obj) {
                 if (want[i] > 0 && running && g_link[i].fails < 3) act[i] = 1;
-            } else if ((want[i] > g_link[i].sent ? want[i] - g_link[i].sent : g_link[i].sent - want[i]) >= 50 ||
+            } else if ((want[i] > g_link[i].sent ? want[i] - g_link[i].sent : g_link[i].sent - want[i]) >= 100 ||
                        (want[i] == 0 && g_link[i].sent != 0)) {
                 act[i] = 2;
             } else if (running && (!g_link[i].started || restart)) {
@@ -1018,6 +1201,7 @@ static void maintain(void)
 
     if (bobj) set_gain_now(bobj, bgain);
     if (zobj) set_gain_now(zobj, 0);
+    bridge_buffet();
     for (i = 0; i < 3; i++) {
         if (drop[i]) {
             PFN_Release rel = (PFN_Release)orig_of(drop[i], FX_Release);
@@ -1089,10 +1273,10 @@ static DWORD WINAPI heartbeat(LPVOID arg)
             s1 = latest_named("Stall1");
             s2 = latest_named("Stall2");
             sp = latest_named("Spring");
-            emit(2, "STATE seq=%u stall1=%ld stall2=%ld spring_k=%ld broken=%d setp=%u", seq++,
+            emit(2, "STATE seq=%u stall1=%ld stall2=%ld spring_k=%ld broken=%d setp=%u buffet=%lu", seq++,
                  s1 ? (long)s1->gain : -1L, s2 ? (long)s2->gain : -1L,
                  sp && sp->ts_len >= sizeof(DICONDITION) ? (long)((DICONDITION *)sp->ts)->lPositiveCoefficient : -1L,
-                 g_brk.active, g_setp_calls);
+                 g_brk.active, g_setp_calls, (unsigned long)g_buf.sent);
         }
         LeaveCriticalSection(&g_cs);
     }
