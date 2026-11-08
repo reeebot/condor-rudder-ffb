@@ -193,6 +193,20 @@ int main(void)
         CHECK(bf > 2 && mfx(bf, 1) == 3000 && mfx(bf, 3) >= 1, "bridge BUFFET -> our triangle on the stick, gain %ld", bf > 2 ? mfx(bf, 1) : -1);
         Sleep(800);                                    /* bridge goes quiet */
         CHECK(bf > 2 && mfx(bf, 1) == 0, "bridge silent for 0.5 s -> buffet off (%ld)", bf > 2 ? mfx(bf, 1) : -1);
+        {
+            const char *g = "BUFFET gain=0 period_ms=70 pitch=2000 roll=1500";
+            int gp = -1, gr = -1, i2, n2;
+            for (k = 0; k < 6; k++) { sendto(c, g, (int)strlen(g), 0, (struct sockaddr *)&to, sizeof to); Sleep(50); }
+            Sleep(150);
+            n2 = mfx(-1, 0);
+            for (i2 = 0; i2 < n2; i2++) if (mfx(i2, 0) == 0) { if (gp < 0) gp = i2; else gr = i2; }
+            CHECK(gp >= 0 && gr >= 0, "gust constant forces created (pitch %d, roll %d)", gp, gr);
+            if (gp >= 0 && gr >= 0) {
+                CHECK(mfx(gp, 2) == 2000 && mfx(gr, 2) == -1500, "gust magnitudes: pitch %ld, roll %ld (roll sign flipped for DirectInput)", mfx(gp, 2), mfx(gr, 2));
+                Sleep(800);
+                CHECK(mfx(gp, 2) == 0 && mfx(gr, 2) == 0, "bridge silent -> gust forces back to 0 (%ld, %ld)", mfx(gp, 2), mfx(gr, 2));
+            }
+        }
         closesocket(c);
     }
 

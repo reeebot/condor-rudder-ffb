@@ -58,14 +58,17 @@ So the shim scales:
 
 And adds two things Condor doesn't do:
 
-- **Linkage** (`[Linkage]`): friction, inertia and damping effects of its own on the stick axes,
-  always on, so moving the stick means moving cables and control surfaces with mass even when
-  parked. The damping grows with airspeed (read from Condor's spring stiffness).
+- **Linkage** (`[Linkage]`): inertia and damping effects of its own on the stick axes, always on,
+  so moving the stick means moving control surfaces with mass even when parked. Friction is
+  available but off: any friction makes a dead zone around centre the spring can't overcome.
+  Damping is constant, because on the Brunner each damping change in flight is felt as a pop.
 - **Wing break** (`[Break]`): when Condor cuts its VNE flutter dead (the wing just broke), the shim
   keeps 40% of it going, fading with airspeed, instead of going silent.
-- **Bridge buffet**: the pedal bridge (which reads the airbrake lever and Condor's airspeed) sends
-  `BUFFET gain= period_ms=` to UDP 55292 and the shim plays it as an extra shake on the stick:
-  airbrake buffet and high-speed buffet (`[StickBuffet]` in `settings.ini`).
+- **Bridge buffet and gusts**: the pedal bridge (which reads the airbrake lever and Condor's flight
+  data) sends `BUFFET gain= period_ms= pitch= roll=` to UDP 55292. The shim plays the buffet as
+  an extra shake (airbrakes, high speed; `[StickBuffet]` in `settings.ini`) and pitch/roll as
+  constant forces: quick load-factor and roll-rate changes - turbulence, airflow - felt as
+  bumps against the stick, not as extra stiffness (`[StickGusts]`).
 
 - **No input lag**: stick axes and buttons never go through it, only force commands do.
 - **Log**: `ffb_shim.log` in the Condor folder lists every effect Condor creates, changes, starts

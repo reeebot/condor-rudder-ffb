@@ -130,7 +130,9 @@ LONG WINAPI MockFx(int idx, int what)
     switch (what) {
     case 0: return e->sub;
     case 1: return (LONG)e->gain;
-    case 2: return (e->sub >= 2 && e->sub <= 6) ? (LONG)((DIPERIODIC *)e->ts)->dwMagnitude : ((DICONDITION *)e->ts)->lPositiveCoefficient;
+    case 2:
+        if (e->sub == 0) return ((DICONSTANTFORCE *)e->ts)->lMagnitude;
+        return (e->sub >= 2 && e->sub <= 6) ? (LONG)((DIPERIODIC *)e->ts)->dwMagnitude : ((DICONDITION *)e->ts)->lPositiveCoefficient;
     case 3: return e->started;
     case 4: return e->released;
     case 5: return (LONG)((DICONDITION *)e->ts)->dwPositiveSaturation;

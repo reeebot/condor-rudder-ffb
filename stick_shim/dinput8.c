@@ -16,7 +16,8 @@
  *   - wing break: Condor cuts its VNE flutter dead; we keep a share of it going (the other
  *     wing and the tail still flutter), fading as the airspeed drops
  *   - bridge buffet: the pedal bridge (which reads the airbrake lever and Condor's flight data)
- *     sends "BUFFET gain=.. period_ms=.." to UDP 55292; we play it as an extra shake on the stick
+ *     sends "BUFFET gain=.. period_ms=.. pitch=.. roll=.." to UDP 55292; we play the buffet as an
+ *     extra shake and pitch/roll as gust forces (constant forces) on the stick
  *   - every effect Condor creates, changes, starts or stops is written to ffb_shim.log and
  *     sent as one text line over UDP to 127.0.0.1 (so the pedal bridge can follow Condor's
  *     own stall/VNE shake)
@@ -37,7 +38,7 @@
 #include <stdlib.h>
 #include <math.h>
 
-#define SHIM_VERSION "0.4"
+#define SHIM_VERSION "0.5"
 
 /* ------------------------------------------------------------------ vtable slots */
 enum { DI8_CreateDevice = 3 };
@@ -62,9 +63,9 @@ typedef struct {
     double shake_curve;
     int break_residual;
     int link_friction, link_inertia, link_damper, link_damper_speed;
-    int cmd_port, bridge_buffet;
+    int cmd_port, bridge_buffet, bridge_gusts;
 } Cfg;
-static Cfg g_cfg = {100, 100, 100, 100, 100, 0, 1, 1, 50, 55291, 1.0, 0, 0, 0, 0, 0, 55292, 100};
+static Cfg g_cfg = {100, 100, 100, 100, 100, 0, 1, 1, 50, 55291, 1.0, 0, 0, 0, 0, 0, 55292, 100, 100};
 static unsigned g_setp_calls;
 static FILETIME g_ini_mtime;
 static DWORD g_ini_check;
@@ -194,6 +195,8 @@ static struct { void *obj; void *dev; LONG sent; int fails; int started; } g_lin
 static int g_link_restart, g_link_drop;
 /* extra shake commanded by the pedal bridge (airbrake / high-speed buffet) */
 static struct { void *obj; void *dev; DWORD want, period_ms, sent, sent_period; DWORD rx_tick; int fails, started; } g_buf;
+/* gust forces from the bridge: constant forces on pitch (0) and roll (1) */
+static struct { void *obj[2]; void *dev; LONG want[2], sent[2]; int fails, started[2]; } g_gust;
 static SOCKET g_cmd = INVALID_SOCKET;
 static int g_cmd_port_bound, g_buf_drop;
 
@@ -330,13 +333,15 @@ static void read_cfg(int announce)
     c.link_damper_speed = clampi(GetPrivateProfileIntA("Linkage", "damper_airspeed", 0, ini), 0, 100);
     c.cmd_port = clampi(GetPrivateProfileIntA("Bridge", "cmd_port", 55292, ini), 0, 65535);
     c.bridge_buffet = clampi(GetPrivateProfileIntA("Gain", "bridge_buffet", 100, ini), 0, 1000);
+    c.bridge_gusts = clampi(GetPrivateProfileIntA("Gain", "bridge_gusts", 100, ini), 0, 1000);
     g_cfg = c;
     if (announce)
         emit(0, "CONFIG spring=%d spring_assist=%d shake=%d shake_curve=%.2f damper=%d constant=%d master=%d "
              "break_residual=%d linkage: friction=%d inertia=%d damper=%d damper_airspeed=%d log=%d log_changes=%d "
-             "udp_port=%d cmd_port=%d bridge_buffet=%d", c.spring, c.spring_assist, c.shake, c.shake_curve, c.damper,
-             c.constant, c.master, c.break_residual, c.link_friction, c.link_inertia, c.link_damper,
-             c.link_damper_speed, c.log, c.log_setp, c.udp_port, c.cmd_port, c.bridge_buffet);
+             "udp_port=%d cmd_port=%d bridge_buffet=%d bridge_gusts=%d", c.spring, c.spring_assist, c.shake,
+             c.shake_curve, c.damper, c.constant, c.master, c.break_residual, c.link_friction, c.link_inertia,
+             c.link_damper, c.link_damper_speed, c.log, c.log_setp, c.udp_port, c.cmd_port, c.bridge_buffet,
+             c.bridge_gusts);
 }
 
 static void maybe_reload(void)
@@ -853,6 +858,7 @@ static HRESULT WINAPI Hook_Start(void *self, DWORD iter, DWORD flags)
         if (f->sub == 7) {
             g_link_restart = 1;
             g_buf.started = 0;
+            g_gust.started[0] = g_gust.started[1] = 0;
         }
     }
     emit(0, "START fx=%d %s %s iter=%lu flags=0x%lx hr=0x%08lx", f ? f->id : -1, f ? f->name : "?",
@@ -995,6 +1001,8 @@ static void poll_commands(void)
         g_buf.want = 0;
         if ((p = strstr(b, "gain="))) g_buf.want = (DWORD)clampi(atoi(p + 5), 0, 10000);
         if ((p = strstr(b, "period_ms="))) g_buf.period_ms = (DWORD)clampi(atoi(p + 10), 10, 1000);
+        g_gust.want[0] = (p = strstr(b, "pitch=")) ? clampi(atoi(p + 6), -10000, 10000) : 0;
+        g_gust.want[1] = (p = strstr(b, "roll=")) ? clampi(atoi(p + 5), -10000, 10000) : 0;
         if (!g_buf.period_ms) g_buf.period_ms = 70;
         g_buf.rx_tick = GetTickCount();
         LeaveCriticalSection(&g_cs);
@@ -1040,7 +1048,6 @@ static void bridge_buffet(void)
         g_buf.sent = 0;
         g_buf.started = 0;
     }
-    g_buf_drop = 0;
     if (dev) {
         if (!g_buf.obj && want > 0 && running && g_buf.fails < 3) act = 1;
         else if (g_buf.obj && ((want > g_buf.sent ? want - g_buf.sent : g_buf.sent - want) >= 50 ||
@@ -1102,6 +1109,108 @@ static void bridge_buffet(void)
         if (SUCCEEDED(hr) && !g_buf.started && running) {
             PFN_Start st = (PFN_Start)orig_of(obj, FX_Start);
             if (st && SUCCEEDED(st(obj, 1, 0))) g_buf.started = 1;
+        }
+    }
+}
+
+static const GUID GUID_ConstantForce_ = {0x13541C20, 0x8E33, 0x11D0, {0x9A, 0xD0, 0x00, 0xA0, 0xC9, 0xA0, 0x6E, 0x35}};
+
+/* Gust forces: one single-axis constant force per stick axis. pitch > 0 pushes the stick
+ * forward, roll > 0 pushes it right (DirectInput forces point away from where they come
+ * from, so the roll magnitude is negated). Silent 0.5 s after the bridge stops sending. */
+static void gust_forces(void)
+{
+    Fx *sp;
+    void *dev = NULL, *drop[2] = {NULL, NULL}, *obj[2];
+    DWORD axis[2] = {0, 0};
+    LONG want[2], sent[2];
+    int i, act[2] = {0, 0}, running = 0, fresh;
+    EnterCriticalSection(&g_cs);
+    fresh = GetTickCount() - g_buf.rx_tick < 500;
+    sp = latest_named("Spring");
+    if (sp && sp->dev && sp->base.cAxes >= 2) {
+        dev = sp->dev;
+        running = sp->running;
+        axis[0] = sp->axes[1];         /* Condor's spring: axes 0 = roll (X), 1 = pitch (Y) */
+        axis[1] = sp->axes[0];
+    }
+    for (i = 0; i < 2; i++) {
+        want[i] = fresh ? (LONG)((long long)g_gust.want[i] * g_cfg.bridge_gusts / 100) : 0;
+        if (want[i] > 10000) want[i] = 10000;
+        if (want[i] < -10000) want[i] = -10000;
+        if (i == 1) want[i] = -want[i];
+        if (g_gust.obj[i] && (g_gust.dev != dev || g_buf_drop)) {
+            drop[i] = g_gust.obj[i];
+            g_gust.obj[i] = NULL;
+            g_gust.sent[i] = 0;
+            g_gust.started[i] = 0;
+        }
+        if (dev) {
+            if (!g_gust.obj[i] && want[i] != 0 && running && g_gust.fails < 6) act[i] = 1;
+            else if (g_gust.obj[i] && ((want[i] - g_gust.sent[i] >= 30 || g_gust.sent[i] - want[i] >= 30) ||
+                                       (want[i] == 0 && g_gust.sent[i] != 0)))
+                act[i] = 2;
+        }
+        obj[i] = g_gust.obj[i];
+        sent[i] = g_gust.sent[i];
+    }
+    LeaveCriticalSection(&g_cs);
+    (void)sent;
+    for (i = 0; i < 2; i++) {
+        DIEFFECT e;
+        DICONSTANTFORCE cf;
+        DWORD ax[1];
+        LONG dir[1] = {1};
+        HRESULT hr;
+        if (drop[i]) {
+            PFN_Release rel = (PFN_Release)orig_of(drop[i], FX_Release);
+            if (rel) rel(drop[i]);
+        }
+        if (!act[i]) continue;
+        ax[0] = axis[i];
+        cf.lMagnitude = want[i];
+        memset(&e, 0, sizeof e);
+        e.dwSize = sizeof e;
+        e.dwFlags = DIEFF_CARTESIAN | DIEFF_OBJECTOFFSETS;
+        e.dwDuration = INFINITE;
+        e.dwGain = 10000;
+        e.dwTriggerButton = DIEB_NOTRIGGER;
+        e.cAxes = 1;
+        e.rgdwAxes = ax;
+        e.rglDirection = dir;
+        e.cbTypeSpecificParams = sizeof cf;
+        e.lpvTypeSpecificParams = &cf;
+        if (act[i] == 1) {
+            PFN_CreateEffect ce = (PFN_CreateEffect)orig_of(dev, DEV_CreateEffect);
+            LPDIRECTINPUTEFFECT o = NULL;
+            HRESULT h2 = DIERR_GENERIC;
+            hr = ce ? ce(dev, &GUID_ConstantForce_, &e, &o, NULL) : DIERR_GENERIC;
+            if (SUCCEEDED(hr) && o) {
+                PFN_Start st = (PFN_Start)orig_of(o, FX_Start);
+                h2 = st ? st(o, 1, 0) : DIERR_GENERIC;
+            }
+            EnterCriticalSection(&g_cs);
+            if (SUCCEEDED(hr) && o) {
+                g_gust.obj[i] = o;
+                g_gust.dev = dev;
+                g_gust.sent[i] = want[i];
+                g_gust.started[i] = SUCCEEDED(h2);
+                emit(0, "GUST %s force created (start hr=0x%08lx)", i ? "roll" : "pitch", (unsigned long)h2);
+            } else {
+                g_gust.fails++;
+                emit(0, "GUST %s create FAILED hr=0x%08lx", i ? "roll" : "pitch", (unsigned long)hr);
+            }
+            LeaveCriticalSection(&g_cs);
+        } else {
+            PFN_SetParameters spf = (PFN_SetParameters)orig_of(obj[i], FX_SetParameters);
+            hr = spf ? spf(obj[i], &e, DIEP_TYPESPECIFICPARAMS) : DIERR_GENERIC;
+            EnterCriticalSection(&g_cs);
+            if (SUCCEEDED(hr)) g_gust.sent[i] = want[i];
+            LeaveCriticalSection(&g_cs);
+            if (SUCCEEDED(hr) && !g_gust.started[i] && running) {
+                PFN_Start st = (PFN_Start)orig_of(obj[i], FX_Start);
+                if (st && SUCCEEDED(st(obj[i], 1, 0))) g_gust.started[i] = 1;
+            }
         }
     }
 }
@@ -1202,6 +1311,10 @@ static void maintain(void)
     if (bobj) set_gain_now(bobj, bgain);
     if (zobj) set_gain_now(zobj, 0);
     bridge_buffet();
+    gust_forces();
+    EnterCriticalSection(&g_cs);
+    g_buf_drop = 0;
+    LeaveCriticalSection(&g_cs);
     for (i = 0; i < 3; i++) {
         if (drop[i]) {
             PFN_Release rel = (PFN_Release)orig_of(drop[i], FX_Release);

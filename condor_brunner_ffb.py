@@ -212,6 +212,14 @@ DEFAULTS = {
     "stick_airbrake_buffet": 30,      # % of the stick's max force at full brakes, full speed
     "stick_hs_buffet": 25,            # % at the high-speed buffet's full speed
     "stick_buffet_period_ms": 70,
+    # --- stick gust forces: bumps from load-factor and roll-rate changes (not stiffer) ---
+    "stick_gust_pitch_per_g": 12.0,   # % of the stick's max force per 1 g change
+    "stick_gust_roll_per_dps": 0.3,   # % per deg/s of roll-rate change
+    "stick_gust_max": 15.0,           # cap, % of max force
+    "stick_gust_pitch_sign": 1,       # flip to -1 if a pull-up pulls the stick further back
+    "stick_gust_roll_sign": 1,        # flip to -1 if rolling drags the stick further into the roll
+    "stick_gust_highpass_s": 0.7,     # slower changes than this are ignored (turns, trim)
+    "stick_gust_smooth_s": 0.05,      # smooths Condor's data steps
 
     # --- structural failure: Condor's stick flutter stops dead when a wing breaks ---
     "failure_detect": True,
@@ -363,6 +371,20 @@ SETTINGS_LAYOUT = [
      [("stick_airbrake_buffet", "Stick buffet at full airbrakes and airbrake_vib_full_kt."),
       ("stick_hs_buffet", "Stick buffet at hs_buffet_full_kt."),
       ("stick_buffet_period_ms", "Shake period (ms). Lower = faster, finer.")]),
+    ("StickGusts",
+     "With the stick shim: turbulence and airflow as forces, not stiffness. A gust that\n"
+     "bumps the load factor pushes the stick against it (and so does your own pull-up,\n"
+     "briefly, like a real stick); a roll gust pushes the stick against the roll. Only\n"
+     "quick changes count - steady turns and trim don't.",
+     [("stick_gust_pitch_per_g", "% of the stick's max force per 1 g of change. 0 = off."),
+      ("stick_gust_roll_per_dps", "% per deg/s of roll-rate change. 0 = off."),
+      ("stick_gust_max", "Most force a gust can add, % of max."),
+      ("stick_gust_pitch_sign", "1 or -1. Pulling up hard should push the stick forward against\n"
+                                "your hand; if it pulls it further back, use -1."),
+      ("stick_gust_roll_sign", "1 or -1. Rolling in should push the stick back against your\n"
+                               "hand; if it drags it further into the roll, use -1."),
+      ("stick_gust_highpass_s", "Changes slower than this (s) are ignored."),
+      ("stick_gust_smooth_s", "Smoothing (s) of Condor's data.")]),
     ("StructuralFailure",
      "When a wing comes off (the stick shim sees Condor cut its VNE flutter, or Condor shows a\n"
      "violent, sustained roll at speed), the flutter drops suddenly - but the tail and the other\n"
@@ -1040,6 +1062,7 @@ class ForceModel:
         self.peak_fast = self.peak_slow = 0.0          # recent vibration, for the residual
         self.peak_fast_ms = self.peak_slow_ms = 50
         self.res = None                   # (fast_f, fast_ms, slow_f, slow_ms, kt) frozen at the break
+        self.gust_f = None                # band-pass filter state for stick gusts: [g_lp, g_base, r_lp, r_base]
         self.prev_time = None
         self.prev_alt = None
 
@@ -1047,6 +1070,31 @@ class ForceModel:
         step = self.c["float_rate_per_s"] * dt
         self.trim += clamp(target - self.trim, -step, step)
         return self.trim
+
+    def _gusts(self, s, dt, quiet):
+        """Stick gust forces (fractions of max, + = push forward / push right) from quick changes
+        in load factor and roll rate: band-passed between stick_gust_smooth_s and _highpass_s."""
+        c = self.c
+        g = s.get("gforce")
+        rr = s.get("rollrate")
+        if not isinstance(g, float) or not isinstance(rr, float):
+            return 0.0, 0.0
+        r = math.degrees(rr)
+        if self.gust_f is None:
+            self.gust_f = [g, g, r, r]
+        f = self.gust_f
+        a_lp = dt / (max(1e-3, c["stick_gust_smooth_s"]) + dt)
+        a_hp = dt / (max(0.05, c["stick_gust_highpass_s"]) + dt)
+        f[0] += a_lp * (g - f[0])
+        f[1] += a_hp * (f[0] - f[1])
+        f[2] += a_lp * (r - f[2])
+        f[3] += a_hp * (f[2] - f[3])
+        if quiet:
+            return 0.0, 0.0
+        cap = max(0.0, c["stick_gust_max"]) / 100.0
+        p = c["stick_gust_pitch_sign"] * c["stick_gust_pitch_per_g"] / 100.0 * (f[0] - f[1])
+        q = -c["stick_gust_roll_sign"] * c["stick_gust_roll_per_dps"] / 100.0 * (f[2] - f[3])
+        return clamp(p, -cap, cap), clamp(q, -cap, cap)
 
     def _latch_broken(self, kt, why):
         if self.broken:
@@ -1233,11 +1281,13 @@ class ForceModel:
             slow_f, slow_ms = rs * fade, rsms
             hs = vnef = stick_buf = 0.0
         cap = c["vib_force_cap"]
+        gust_p, gust_r = self._gusts(s, dt, on_ground or self.broken)
         self.info = {"mode": "GROUND" if on_ground else "AIR", "kt": kt, "gs": gs,
                      "yaw_deg": math.degrees(yaw), "fade": fade, "g": g, "onset": onset,
                      "limp": self.limp, "load": eff_load,
                      "stall": stall_pct, "ab": airbrake, "hs": hs if not on_ground else 0.0,
-                     "broken": self.broken, "src": stall_src, "vne": vnef, "stick_buffet": stick_buf}
+                     "broken": self.broken, "src": stall_src, "vne": vnef, "stick_buffet": stick_buf,
+                     "gust_pitch": gust_p, "gust_roll": gust_r}
         damp = max(0.0, c["damping_rest"] + c["damping_per_100kt"] * kt / 100.0)
         self.info["damp"] = damp
         return Targets(sf, trim,
@@ -1713,9 +1763,12 @@ def run_bridge(cfg, dry_run=False, watcher=None, max_seconds=0.0):
             t = model.update(condor.state, period, ab, shake) if live else model.neutral(period)
             if shim_live and cfg["shim_cmd_port"] > 0:
                 gain = int(round(10000 * model.info.get("stick_buffet", 0.0)))
+                gp = int(round(10000 * model.info.get("gust_pitch", 0.0)))
+                gr = int(round(10000 * model.info.get("gust_roll", 0.0)))
                 try:
-                    shim_tx.sendto(f"BUFFET gain={gain} period_ms={int(cfg['stick_buffet_period_ms'])}"
-                                   .encode("ascii"), ("127.0.0.1", int(cfg["shim_cmd_port"])))
+                    shim_tx.sendto(f"BUFFET gain={gain} period_ms={int(cfg['stick_buffet_period_ms'])} "
+                                   f"pitch={gp} roll={gr}".encode("ascii"),
+                                   ("127.0.0.1", int(cfg["shim_cmd_port"])))
                 except OSError:
                     pass
 
