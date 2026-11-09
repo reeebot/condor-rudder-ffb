@@ -133,16 +133,18 @@ check(mod.info["gust_pitch"] == 0 and mod.info["gust_roll"] == 0, "on the ground
 import threading
 CPORT, SPORT, KPORT = 55395, 55396, 55397
 bcfg = dict(cfg, condor_listen_port=CPORT, shim_udp_port=SPORT, shim_cmd_port=KPORT, forward_to="")
-rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); rx.bind(("127.0.0.1", KPORT)); rx.settimeout(0.2)
-th = threading.Thread(target=m.run_bridge, args=(bcfg, True, None, 2.5), daemon=True)
+rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); rx.bind(("127.0.0.1", KPORT)); rx.setblocking(False)
+th = threading.Thread(target=m.run_bridge, args=(bcfg, True, None, 3.6), daemon=True)
 th.start()
 t0 = time.monotonic(); simtime = 12.0; got = []
-while time.monotonic() - t0 < 2.4:
+while time.monotonic() - t0 < 3.5:
+    flying = time.monotonic() - t0 < 2.4         # then Condor goes quiet, the shim stays live
     simtime += 0.02 / 3600
     gf = 1.0 + 0.4 * math.sin((time.monotonic() - t0) * 6)
     msg = (f"time={simtime}\r\nairspeed={140 * 0.514444}\r\naltitude=900\r\nyawstringangle=0\r\n"
            f"vx=70\r\nvy=0\r\nvz=0\r\nheight=400\r\nwheelheight=400\r\ngforce={gf}\r\nrollrate=0.0\r\n")
-    tx.sendto(msg.encode(), ("127.0.0.1", CPORT))
+    if flying:
+        tx.sendto(msg.encode(), ("127.0.0.1", CPORT))
     tx.sendto(b"0 STATE seq=1 stall1=0 stall2=0 spring_k=10000 broken=0", ("127.0.0.1", SPORT))
     try:
         while True:
@@ -152,7 +154,7 @@ while time.monotonic() - t0 < 2.4:
     except BlockingIOError:
         pass
     time.sleep(0.02)
-th.join(3)
+th.join(4)
 gains = [int(g.split("gain=")[1].split()[0]) for g in got if g.startswith("BUFFET gain=")]
 pitches = [int(g.split("pitch=")[1].split()[0]) for g in got if "pitch=" in g]
 check(pitches and max(abs(x) for x in pitches) > 300, f"bridge -> shim gust pitch forces, peak {max(abs(x) for x in pitches or [0])}")

@@ -122,7 +122,7 @@ DEFAULTS = {
     # --- loop ---
     "tick_hz": 30,
     "stale_after_s": 0.5,             # no new Condor time for this long -> neutral
-    "resend_all_every_s": 2.0,        # re-assert everything (survives Profile Manager "Apply")
+    "resend_all_every_s": 30.0,       # re-assert everything (survives Profile Manager "Apply")
     "watchdog_ms": 0,                 # 0=off. >0: CLS2Sim STOPS the drives if the bridge dies
 
     # --- airflow load vs airspeed. No mechanical spring: limp at rest. ---
@@ -407,7 +407,10 @@ SETTINGS_LAYOUT = [
       ("ias_tau_s", "Airspeed smoothing (s). Higher = smoother, laggier stiffness changes."),
       ("yaw_tau_s", "Yaw string smoothing (s). Higher = less twitchy yaw feel."),
       ("stale_after_s", "No new Condor data for this long -> pedals go neutral (s)."),
-      ("resend_all_every_s", "Re-send everything to CLS2Sim this often (s)."),
+      ("resend_all_every_s", "Re-assert everything to CLS2Sim this often (s), one item per tick so\n"
+                             "it never arrives as a burst. Only matters if you hit Apply in\n"
+                             "CLS2Sim's Profile Manager mid-flight. Short intervals (2 s) gave\n"
+                             "a periodic stutter in VR."),
       ("tick_hz", "(restart) Update rate (Hz)."),
       ("watchdog_ms", "(restart) 0 = off. >0: CLS2Sim STOPS the pedals if this app dies.")]),
     ("Network",
@@ -1333,13 +1336,19 @@ class Output:
                 self.sent[key] = val
             self.sends += 1
 
+    REFRESH_ORDER = ("control", "sf", "trim", "move_back", "damp", "vib")
+
     def apply(self, t, force=False):
+        """force: True = re-send everything now; a set of REFRESH_ORDER names = re-send just those."""
         if self.c["watchdog_ms"]:
             self.cls.watchdog(self.c["watchdog_ms"])
-        self._set("sf", SET_SCALE, "H", int(t.sf), force)
-        self._set("trim", SET_TRIM, "f", float(t.trim), force)
-        self._set("move_back", SET_MOVE_BACK, "B", int(t.move_back), force)
-        if self.damp_fails < 3 and self._changed("damp", t.damp, force):
+        f = (lambda name: True) if force is True else (lambda name: bool(force) and name in force)
+        if force is not True and f("control"):
+            self.take_control()
+        self._set("sf", SET_SCALE, "H", int(t.sf), f("sf"))
+        self._set("trim", SET_TRIM, "f", float(t.trim), f("trim"))
+        self._set("move_back", SET_MOVE_BACK, "B", int(t.move_back), f("move_back"))
+        if self.damp_fails < 3 and self._changed("damp", t.damp, f("damp")):
             if self.cls.setting(self.axis, SET_FRICTION_BY_VELOCITY, "ff", float(t.damp),
                                 float(self.c["damping_limit"])):
                 self.sent["damp"] = t.damp
@@ -1352,6 +1361,7 @@ class Output:
             self.sends += 1
 
         want_on = 1 if (t.fast_f > 0 or t.slow_f > 0) else 0
+        force = f("vib")
         if want_on and (self.vib_on != 1 or force):
             if self.cls.setting(self.axis, SET_VIB_ON, "B", 1):
                 self.vib_on = 1
@@ -1735,6 +1745,7 @@ def run_bridge(cfg, dry_run=False, watcher=None, max_seconds=0.0):
     period = 1.0 / cfg["tick_hz"]
     next_tick = time.monotonic()
     last_full = last_status = last_settings = time.monotonic()
+    refresh = []
     connected = True
     pos_txt = ""
     t_start = time.monotonic()
@@ -1774,11 +1785,10 @@ def run_bridge(cfg, dry_run=False, watcher=None, max_seconds=0.0):
 
             if out:
                 if connected:
-                    full = (now - last_full) >= cfg["resend_all_every_s"]
-                    if full:
+                    if (now - last_full) >= cfg["resend_all_every_s"]:
                         last_full = now
-                        out.take_control()
-                    out.apply(t, force=full)
+                        refresh = list(Output.REFRESH_ORDER)    # one item per tick, never a burst
+                    out.apply(t, force={refresh.pop(0)} if refresh else False)
                     if cls.fail_streak > 15:
                         connected = False
                         print("\n[!] Lost CLS2Sim. Retrying...")
