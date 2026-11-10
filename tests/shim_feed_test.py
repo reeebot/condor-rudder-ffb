@@ -125,7 +125,8 @@ for i in range(90):
 st["gforce"] = 1.5
 peak = 0
 for i in range(6):
-    st["time"] += 0.033; mod.update(st, 1 / 30, 0.0, (0, 0, False)); peak = max(peak, mod.info["gust_pitch"])
+    st["time"] += 0.033; mod.update(st, 1 / 30, 0.0, (0, 0, False))
+    peak = max(peak, mod.info["gust_pitch"] * cfg["stick_gust_pitch_sign"])
 check(0.03 < peak <= cfg["stick_gust_max"] / 100, f"+0.5 g bump -> push forward {peak * 100:.1f}% (cap {cfg['stick_gust_max']}%)")
 for i in range(150):
     st["time"] += 0.033; mod.update(st, 1 / 30, 0.0, (0, 0, False))

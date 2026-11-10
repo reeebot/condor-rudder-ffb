@@ -219,7 +219,7 @@ DEFAULTS = {
     "stick_gust_max": 15.0,           # cap, % of max force
     "stick_gust_pitch_deadband_g": 0.08,  # load-factor wiggles smaller than this are ignored
     "stick_gust_roll_deadband_dps": 3.0,  # roll-rate wiggles smaller than this are ignored
-    "stick_gust_pitch_sign": 1,       # flip to -1 if a pull-up pulls the stick further back
+    "stick_gust_pitch_sign": -1,      # -1 on Rebot's CLS-E (DirectX mode pushes the other way)
     "stick_gust_roll_sign": 1,        # flip to -1 if rolling drags the stick further into the roll
     "stick_gust_highpass_s": 0.7,     # slower changes than this are ignored (turns, trim)
     "stick_gust_smooth_s": 0.05,      # smooths Condor's data steps
@@ -389,8 +389,9 @@ SETTINGS_LAYOUT = [
                                       "stick sits dead still in smooth air instead of wiggling\n"
                                       "around centre. Bigger bumps come through (minus this)."),
       ("stick_gust_roll_deadband_dps", "Same for roll-rate changes (deg/s)."),
-      ("stick_gust_pitch_sign", "1 or -1. Pulling up hard should push the stick forward against\n"
-                                "your hand; if it pulls it further back, use -1."),
+      ("stick_gust_pitch_sign", "1 or -1. Pulling up should push the stick forward against your\n"
+                                "hand. Wrong sign = the stick 'sticks' wherever you put it near\n"
+                                "centre (it holds itself there). -1 on Rebot's CLS-E."),
       ("stick_gust_roll_sign", "1 or -1. Rolling in should push the stick back against your\n"
                                "hand; if it drags it further into the roll, use -1."),
       ("stick_gust_highpass_s", "Changes slower than this (s) are ignored."),
