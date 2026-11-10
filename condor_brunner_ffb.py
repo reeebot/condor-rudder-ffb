@@ -217,6 +217,8 @@ DEFAULTS = {
     "stick_gust_pitch_per_g": 12.0,   # % of the stick's max force per 1 g change
     "stick_gust_roll_per_dps": 0.3,   # % per deg/s of roll-rate change
     "stick_gust_max": 15.0,           # cap, % of max force
+    "stick_gust_pitch_deadband_g": 0.08,  # load-factor wiggles smaller than this are ignored
+    "stick_gust_roll_deadband_dps": 3.0,  # roll-rate wiggles smaller than this are ignored
     "stick_gust_pitch_sign": 1,       # flip to -1 if a pull-up pulls the stick further back
     "stick_gust_roll_sign": 1,        # flip to -1 if rolling drags the stick further into the roll
     "stick_gust_highpass_s": 0.7,     # slower changes than this are ignored (turns, trim)
@@ -383,6 +385,10 @@ SETTINGS_LAYOUT = [
      [("stick_gust_pitch_per_g", "% of the stick's max force per 1 g of change. 0 = off."),
       ("stick_gust_roll_per_dps", "% per deg/s of roll-rate change. 0 = off."),
       ("stick_gust_max", "Most force a gust can add, % of max."),
+      ("stick_gust_pitch_deadband_g", "Load-factor changes smaller than this (g) add nothing, so the\n"
+                                      "stick sits dead still in smooth air instead of wiggling\n"
+                                      "around centre. Bigger bumps come through (minus this)."),
+      ("stick_gust_roll_deadband_dps", "Same for roll-rate changes (deg/s)."),
       ("stick_gust_pitch_sign", "1 or -1. Pulling up hard should push the stick forward against\n"
                                 "your hand; if it pulls it further back, use -1."),
       ("stick_gust_roll_sign", "1 or -1. Rolling in should push the stick back against your\n"
@@ -1099,8 +1105,14 @@ class ForceModel:
         if quiet:
             return 0.0, 0.0
         cap = max(0.0, c["stick_gust_max"]) / 100.0
-        p = c["stick_gust_pitch_sign"] * c["stick_gust_pitch_per_g"] / 100.0 * (f[0] - f[1])
-        q = -c["stick_gust_roll_sign"] * c["stick_gust_roll_per_dps"] / 100.0 * (f[2] - f[3])
+
+        def soft(x, band):                # zero inside the band, continuous outside it
+            band = max(0.0, band)
+            return math.copysign(max(0.0, abs(x) - band), x)
+        p = c["stick_gust_pitch_sign"] * c["stick_gust_pitch_per_g"] / 100.0 * \
+            soft(f[0] - f[1], c["stick_gust_pitch_deadband_g"])
+        q = -c["stick_gust_roll_sign"] * c["stick_gust_roll_per_dps"] / 100.0 * \
+            soft(f[2] - f[3], c["stick_gust_roll_deadband_dps"])
         return clamp(p, -cap, cap), clamp(q, -cap, cap)
 
     def _latch_broken(self, kt, why):

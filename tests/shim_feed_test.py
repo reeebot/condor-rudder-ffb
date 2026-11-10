@@ -112,11 +112,21 @@ st = dict(air, airspeed=60 * 0.514444, gforce=1.0, rollrate=0.0)
 for i in range(90):
     st["time"] = 1.0 + i * 0.033; mod.update(st, 1 / 30, 0.0, (0, 0, False))
 check(abs(mod.info["gust_pitch"]) < 1e-3, f"steady 1 g -> no gust force ({mod.info['gust_pitch']:.4f})")
+import random
+random.seed(1)
+worst = 0.0
+for i in range(150):                                  # smooth air: +-0.05 g of noise
+    st["time"] += 0.033; st["gforce"] = 1.0 + random.uniform(-0.05, 0.05)
+    mod.update(st, 1 / 30, 0.0, (0, 0, False)); worst = max(worst, abs(mod.info["gust_pitch"]))
+check(worst == 0.0, f"smooth air (+-0.05 g noise) -> stick dead still, no wiggle ({worst * 100:.2f}%)")
+st["gforce"] = 1.0
+for i in range(90):
+    st["time"] += 0.033; mod.update(st, 1 / 30, 0.0, (0, 0, False))
 st["gforce"] = 1.5
 peak = 0
 for i in range(6):
     st["time"] += 0.033; mod.update(st, 1 / 30, 0.0, (0, 0, False)); peak = max(peak, mod.info["gust_pitch"])
-check(0.04 < peak <= cfg["stick_gust_max"] / 100, f"+0.5 g bump -> push forward {peak * 100:.1f}% (cap {cfg['stick_gust_max']}%)")
+check(0.03 < peak <= cfg["stick_gust_max"] / 100, f"+0.5 g bump -> push forward {peak * 100:.1f}% (cap {cfg['stick_gust_max']}%)")
 for i in range(150):
     st["time"] += 0.033; mod.update(st, 1 / 30, 0.0, (0, 0, False))
 check(abs(mod.info["gust_pitch"]) < 0.005, f"held 1.5 g (steady turn) -> fades out ({mod.info['gust_pitch'] * 100:.2f}%)")
