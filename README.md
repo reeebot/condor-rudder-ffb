@@ -18,7 +18,7 @@ Python 3.8+, standard library only. Windows.
 |---|---|
 | **Airflow load** | No spring. Stopped or slow, the pedals are limp and stay where you put them. From ~3 kt the airflow centres them, building with airspeed; above 70 kt (about ¾ of max) it keeps rising more gently up to ~133 kt. |
 | **Linkage** | The cables still move the rudder's mass: some resistance even parked (no centring), plus damping against quick pedal movements that grows with airspeed (CLS2Sim friction-by-velocity). |
-| **Yaw feel** | The pedal you push pushes back harder the further you yaw (driven by Condor's yaw string). |
+| **Yaw feel** | The rudder floats with the airflow at the tail (from Condor's yaw string): wind from the left eases the right pedal forward, and in a slip you hold the pushed pedal gets a bit lighter. `float_mode = resist` flips it. |
 | **Stall flutter** | With the stick shim installed, the pedals flutter with **Condor's own stall shake**: same moment and strength as the stick, right for every glider and ballast. Without it: IAS below stall onset × √g. Plus a faster buzz deep in the stall. |
 | **Airbrake buffet** | Condor doesn't send airbrake position, so the bridge reads your airbrake lever directly. Already strong by ~60 kt (about 80%), full at 110 kt. |
 | **Structural failure** | When a wing comes off (the shim sees Condor cut its VNE flutter, or a violent sustained roll at speed), the flutter drops suddenly to 40% - the tail and the other wing are still in the airflow - and fades as you slow down. |

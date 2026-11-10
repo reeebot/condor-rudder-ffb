@@ -42,7 +42,7 @@ def main():
         ("no malformed / out-of-range packets", not [r for r in recs if r.get("bad") or r["status"]]),
         ("saw ground roll and airborne phases", "GROUND" in out and "AIR " in out),
         ("limp at low speed, airflow centring later", 0 in move_back and 1 in move_back),
-        ("yaw feel reacts to the slip (trim > +0.1)", any(t > 0.1 for t in trims)),
+        ("yaw feel: rudder floats downwind in the left slip (trim < -0.1)", any(t < -0.1 for t in trims)),
         ("overrides released at the end", bool(overrides) and overrides[-1]["axis"] == 0),
         ("pedals handed back to CLS2Sim", "Overrides released" in out),
     ]

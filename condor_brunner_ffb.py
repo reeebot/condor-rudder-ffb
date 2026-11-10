@@ -77,10 +77,11 @@ TUNING -> settings.ini (next to this script)
   --settings PATH uses another file; --write-settings PATH writes a fresh default one.
 
 YAW FEEL (float_mode) and SIGN CALIBRATION (float_sign)
-  float_mode "resist" (default): pedal force builds with sideslip - the pedal you push
-    pushes back harder the further you yaw (what certified aircraft are required to do).
-  float_mode "stream": unbalanced free rudder that streams downwind - the pushed pedal
-    gets lighter in a slip.
+  float_mode "stream" (default): the rudder floats with the airflow at the tail, like a real
+    free rudder. Wind from the left (yaw string blown right) -> the rudder trails right ->
+    right pedal drifts forward. In a slip you hold, the pushed pedal gets a bit lighter.
+  float_mode "resist": the opposite shift - the pushed pedal pushes back harder the more
+    you yaw. Easier to feel, but backwards for a gust or crosswind you didn't cause.
   float_sign is calibration only. Verified on Rebot's CLS-E MkII + Condor 3, 2026-11-05:
     CLS2Sim trim +0.25 -> right pedal forward; left-pedal slip -> yawstringangle negative
     => float_sign = 1. Don't change it unless the hardware or Condor changes.
@@ -144,8 +145,8 @@ DEFAULTS = {
     "sf_max": 240,
 
     # --- yaw feel from sideslip (trim position, -1..1) ---
-    "float_mode": "resist",           # "resist" = force builds with yaw, "stream" = lightens
-    "float_gain_per_rad": 1.6,        # trim offset per rad of yaw string. 15 deg -> ~0.42
+    "float_mode": "stream",           # "stream" = rudder floats with the airflow (real), "resist" = opposite
+    "float_gain_per_rad": 1.0,        # trim offset per rad of yaw string. 15 deg -> ~0.26
     "float_sign": 1,                  # CALIBRATION, verified for this setup - leave at 1
     "float_max": 0.5,
     "float_fade_start_kt": 10.0,      # yaw string is noise below this
@@ -293,8 +294,11 @@ SETTINGS_LAYOUT = [
       ("damping_limit", "Most force the damping can add (N, or Nm on rotational pedals).")]),
     ("YawFeel",
      "How the pedals react to sideslip (yaw string).",
-     [("float_mode", "resist = the pedal you push pushes back harder the more you yaw.\n"
-                     "stream = free-floating rudder: the pushed pedal gets LIGHTER in a slip."),
+     [("float_mode", "stream = the rudder floats with the airflow like a real one: wind from\n"
+                     "the left (yaw string blown right) eases the right pedal forward; in a slip\n"
+                     "you hold, the pushed pedal gets a bit lighter.\n"
+                     "resist = the opposite: the pushed pedal pushes back harder the more you\n"
+                     "yaw (not physical, but easy to feel)."),
       ("float_gain_per_rad", "Strength. Spring-centre shift per radian of yaw string\n"
                              "(15 deg of yaw ~ 0.26 rad x gain). Higher = more yaw pressure."),
       ("float_max", "Max centre shift, 0-1 of half pedal travel."),
@@ -1169,8 +1173,9 @@ class ForceModel:
         eff_load = sf / div               # what you actually feel, % of original profile
 
         # 2) yaw feel: shift the spring centre with sideslip (yaw string), faded in with IAS.
-        #    resist: centre moves away from the pushed pedal -> force grows with yaw.
-        #    stream: centre follows the pushed pedal -> force eases (free-floating rudder).
+        #    stream: centre moves downwind with the airflow (free rudder floating): string
+        #            blown right (+) -> centre toward right pedal forward.
+        #    resist: the opposite shift -> force grows with yaw.
         yaw = self.yaw(float(s.get("yawstringangle", 0.0)), dt)
         span = max(1e-6, c["float_fade_full_kt"] - c["float_fade_start_kt"])
         fade = clamp((kt - c["float_fade_start_kt"]) / span, 0.0, 1.0)
