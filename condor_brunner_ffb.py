@@ -167,8 +167,8 @@ DEFAULTS = {
 
     # --- linkage: the cables still move the rudder's mass, even when stopped ---
     "limp_load_pct": 20.0,            # how heavy the limp pedals are at rest (% of original profile)
-    "damping_rest": 0.02,             # CLS2Sim friction-by-velocity factor when stopped
-    "damping_per_100kt": 0.06,        # extra damping per 100 kt (air on the rudder)
+    "damping_rest": 0.0,              # CLS2Sim friction-by-velocity factor when stopped (off: suspect in a CLS2Sim crash)
+    "damping_per_100kt": 0.0,         # extra damping per 100 kt (air on the rudder)
     "damping_limit": 15.0,            # cap on the damping force (N or Nm)
 
     # --- airborne slow vibration channel: stall flutter (+ optional turbulence) ---
@@ -291,7 +291,10 @@ SETTINGS_LAYOUT = [
      "Damping uses CLS2Sim's friction-by-velocity: factor x pedal speed (mm/s or deg/s) = force.",
      [("limp_load_pct", "How heavy the pedals feel when limp (stopped / slow), % of your original\n"
                         "profile. No centring at rest - they stay where you put them."),
-      ("damping_rest", "Damping factor when stopped. 0 = none. Try steps of 0.01."),
+      ("damping_rest", "Damping factor when stopped. 0 = none (and with both damping settings\n"
+                       "at 0 the bridge never sends CLS2Sim this setting at all). It's off by\n"
+                       "default: it's the newest CLS2Sim feature the bridge uses and a suspect in\n"
+                       "a CLS2Sim crash. Try steps of 0.01 if you want it."),
       ("damping_per_100kt", "Extra damping factor per 100 kt of airspeed."),
       ("damping_limit", "Most force the damping can add (N, or Nm on rotational pedals).")]),
     ("YawFeel",
@@ -1366,7 +1369,8 @@ class Output:
         self._set("sf", SET_SCALE, "H", int(t.sf), f("sf"))
         self._set("trim", SET_TRIM, "f", float(t.trim), f("trim"))
         self._set("move_back", SET_MOVE_BACK, "B", int(t.move_back), f("move_back"))
-        if self.damp_fails < 3 and self._changed("damp", t.damp, f("damp")):
+        damp_used = self.c["damping_rest"] > 0 or self.c["damping_per_100kt"] > 0 or self.sent.get("damp", 0) > 0
+        if damp_used and self.damp_fails < 3 and self._changed("damp", t.damp, f("damp")):
             if self.cls.setting(self.axis, SET_FRICTION_BY_VELOCITY, "ff", float(t.damp),
                                 float(self.c["damping_limit"])):
                 self.sent["damp"] = t.damp
@@ -1403,7 +1407,7 @@ class Output:
         self.cls.setting(a, SET_TRIM, "f", 0.0)
         self.cls.setting(a, SET_SCALE, "H", full_scale(self.c))
         self.cls.setting(a, SET_MOVE_BACK, "B", 1)   # back to the profile's normal centring
-        if self.damp_fails < 3:
+        if self.damp_fails < 3 and self.sent.get("damp", 0) > 0:
             self.cls.setting(a, SET_FRICTION_BY_VELOCITY, "ff", 0.0, 0.0)
         for oid in (OVR_SCALE, OVR_TRIM, OVR_VIB):
             self.cls.override(oid, 0)            # axis 0 = override off
