@@ -214,8 +214,8 @@ DEFAULTS = {
     "stick_hs_buffet": 25,            # % at the high-speed buffet's full speed
     "stick_buffet_period_ms": 70,
     # --- stick gust forces: bumps from load-factor and roll-rate changes (not stiffer) ---
-    "stick_gust_pitch_per_g": 12.0,   # % of the stick's max force per 1 g change
-    "stick_gust_roll_per_dps": 0.3,   # % per deg/s of roll-rate change
+    "stick_gust_pitch_per_g": 0.0,    # OFF: closes a loop through your own stick input (see below)
+    "stick_gust_roll_per_dps": 0.0,   # OFF, same reason
     "stick_gust_max": 15.0,           # cap, % of max force
     "stick_gust_pitch_deadband_g": 0.08,  # load-factor wiggles smaller than this are ignored
     "stick_gust_roll_deadband_dps": 3.0,  # roll-rate wiggles smaller than this are ignored
@@ -378,10 +378,10 @@ SETTINGS_LAYOUT = [
       ("stick_hs_buffet", "Stick buffet at hs_buffet_full_kt."),
       ("stick_buffet_period_ms", "Shake period (ms). Lower = faster, finer.")]),
     ("StickGusts",
-     "With the stick shim: turbulence and airflow as forces, not stiffness. A gust that\n"
-     "bumps the load factor pushes the stick against it (and so does your own pull-up,\n"
-     "briefly, like a real stick); a roll gust pushes the stick against the roll. Only\n"
-     "quick changes count - steady turns and trim don't.",
+     "OFF by default - don't turn on. Load factor and roll rate respond to YOUR stick input,\n"
+     "so feeding them back as stick force closes a loop through Condor's ~0.1 s of delay:\n"
+     "one sign holds the stick off centre, the other makes it slam back and forth.\n"
+     "Kept only for experiments; turbulence nudges need an input the stick can't affect.",
      [("stick_gust_pitch_per_g", "% of the stick's max force per 1 g of change. 0 = off."),
       ("stick_gust_roll_per_dps", "% per deg/s of roll-rate change. 0 = off."),
       ("stick_gust_max", "Most force a gust can add, % of max."),

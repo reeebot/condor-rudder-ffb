@@ -10,7 +10,7 @@ def check(ok, msg):
     print(("  PASS  " if ok else "  FAIL  ") + msg)
     fails += 0 if ok else 1
 
-cfg = dict(m.DEFAULTS)
+cfg = dict(m.DEFAULTS, stick_gust_pitch_per_g=12.0, stick_gust_roll_per_dps=0.3)  # gusts are off by default
 PORT = 55391
 shim = m.ShimIn(PORT)
 tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
